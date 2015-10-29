@@ -1,0 +1,19 @@
+#!/bin/sh
+
+# Run synchronization of projects in singleton mode.
+# If this script is run parallelly, the behavior is unpredictable.
+
+PID_FILE=/var/run/gitview/gitview-sync.pid
+PYTHON_SITELIB=$(python -c "from distutils.sysconfig import get_python_lib; print get_python_lib()")
+MANAGE_PY=${PYTHON_SITELIB}/gitview/manage.py
+SETTINGS_MODULE=gitview.product_settings
+LOG_FILE=/var/log/gitview/projects_refresh_cron.log
+
+
+if [ -e $PID_FILE ]; then
+    exit 1;
+fi
+
+echo $$ > $PID_FILE
+python $MANAGE_PY viewapp_refresh --settings=$SETTINGS_MODULE --all >> $LOG_FILE 2>&1
+rm $PID_FILE

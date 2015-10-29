@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block breadcrumb %}
+<li><a href="{% url 'index' %}">Home</a> <span class="divider">/</span></li>
+<li><a href="#">{{project}}</a> <span class="divider">/</span></li>
+{% endblock %}
+{% block content %}
+{%if project%}
+<div class="container">
+	<div class="row-fluid">
+		<div class="span2"></div>
+		<div class="span8">
+			{% for branch, stat, commit_info in branches %}
+			<table  align="center" class="table table-striped">
+				<h2 align="left">Branch: {{branch.name}}</h2>
+				<tr>
+					<td>Branch name: {{branch.name}}</td>
+					<td>Start Date: {{branch.start_date}}</td>
+					<td>Update Date: {{commit_info.submit_date}}</td>
+					<td>Latest Commit: {{commit_info.commit_hash|slice:":7"}}</td>
+				</tr>
+				<tr>
+					<td>Total Commits: {{ stat.commits_count }}</td>
+					<td>Total lines: {{ stat.total_lines }}</td>
+					<td>Total Inserted(+): {{ stat.lines_inserted }}</td>
+					<td>Total Deleted(-): {{ stat.lines_deleted }}</td>
+				</tr>
+			</table>
+			{% endfor %}
+		</div>
+		<div class="span2"></div>
+	</div>
+</div>
+{%endif%}
+{% endblock %}

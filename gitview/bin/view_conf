@@ -1,0 +1,30 @@
+#!/bin/sh
+# Using crontab to configure a scheduled task, for refreshing data regularly
+
+PROGRAM_NAME=`basename $0`
+
+case $1 in
+    "-h" | "--help" | "help")
+	echo "Create cron job for user apache to synchronize git repositories of"
+	echo "all cloned projects."
+	echo
+	echo "usage: ${PROGRAM_NAME} job_control_file log_file"
+	echo
+	echo "This job will run on 6, 12, and 18 clock from Mon. to Fri."
+	echo
+	echo "You have to ensure apache user has the proper permissions to"
+	echo "read/write upon both these file."
+	exit;;
+esac
+
+CRON_JOB_CONTROL_FILE=$1
+CRON_JOB_LOG_FILE=$2
+
+# Module to execute django command
+MANAGE_MODULE=/usr/lib/python2.6/site-packages/gitview/manage.py
+
+CRON_JOB_COMMAND="0 6,12,18 * * 1-5 python ${MANAGE_MODULE} viewapp_refresh --settings=gitview.product_settings --all >> ${CRON_JOB_LOG_FILE} 2>&1"
+
+# Configure a scheduled task
+echo "$CRON_JOB_COMMAND"  > $CRON_JOB_CONTROL_FILE
+crontab -u apache $CRON_JOB_CONTROL_FILE

@@ -1,0 +1,8 @@
+include README.md *.txt *.rst Makefile
+include gitview.spec
+recursive-include bin *
+recursive-include conf *
+recursive-include gitview *.py
+recursive-include gitview/static *.css *.js
+recursive-include gitview/templates *.html
+recursive-include requirements *.txt

@@ -1,0 +1,33 @@
+#!/bin/sh
+#
+# 2015-05-21 - tps helper for 2.44.4-1 release
+#
+# This script is invoked by /usr/local/bin/update-tps in some circumstances
+# upon successful completion of rpm -Uvh tps-<new>.rpm.
+#
+# This particular 2.44.4-1 script does nothing important on the tps-client
+# host; it simply logs to a central location so our developers can track
+# which tps systems have updated and when.
+#
+
+# This directory is unmanageable, it currently (2015-05-21) contains
+# one file for each system running tps.
+LOGDIR_BASE=/mnt/qa/scratch/ss-provisioning-logs
+
+# For cleanliness, our log goes into a subdirectory with our exact V-R.
+# FIXME: determine this from our script name ($0) instead of hardcoding!
+VR=2.44.4-1
+LOGDIR=${LOGDIR_BASE}/${VR}
+
+# Let's hope that a human has already created the directory, but if not,
+# try to make it ourself. This has a fatal race condition if two systems
+# get to this point at the same time: one of the mkdirs will fail. We
+# don't want -p because we don't want to create parent dirs (if they
+# don't already exist, it indicates a problem on the tps system).
+test -d $LOGDIR || mkdir --mode=2775 $LOGDIR || exit 1
+
+# e.g. 2015-05-21T18:31:54--foo.ss.etc.redhat.com
+LOGFILE=${LOGDIR}/$(date --utc +'%Y-%m-%dT%H:%M:%S')--$(hostname --fqdn)
+
+# Can you think of anything better we could put in here?
+tps-status >> $LOGFILE

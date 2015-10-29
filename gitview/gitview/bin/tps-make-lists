@@ -1,0 +1,2175 @@
+#!/usr/bin/perl
+
+package TPS::MakeLists;
+
+use Getopt::Long;
+use FindBin;
+use FindBin qw($RealBin);
+use IO::Handle;
+use XML::Parser::Expat;
+## Remove before release:
+use Data::Dumper;
+
+require "${RealBin}/tps-lib.pl";
+require "${RealBin}/tps-vercmp.pl";
+use vars qw{ $globs @testFunctionList @testFunctionUserNames $tpsErrorText $debug $foundReleasedPackages };
+use vars qw{ $TPSFATAL $TPSBUG $TPSERROR $TPSWARN $TPSWARNING $TPSFAILTXT $TPSTXT };
+use vars qw{ $TPSRESULT $TPSBEGIN $TPSEND $TPSSUBBEGIN $TPSSUBEND $TPSHINT $TPSTIP };
+use vars qw{ $TPSINFO $TPSCMD $TPSCMDOUT $TPSMISC $TPSDEBUG $TPSRAWLINK $TPSNOISE $TPSLOG $TPSRPT $TPSCRIT };
+use vars qw{ %channelsForPkg $oldFileNotFound $newFileNotFound $PrimaryErratum };
+#### FIXME FIXME FIXME       ############################################
+## $ENV{PATH} .= ":${RealBin}"; ### REMOVE THIS LINE AFTER TESTING.     ####
+#### FIXME FIXME FIXME       ############################################
+use strict;
+
+my ($arch, $help, $logfile, $release, $erratum, $reportfile, $verbose);
+my ($channelArg, $no_logs, $fNames, $outDir, $forceETRelease, @channelArgList,@excludeDepList);
+my ($errataArg, $primaryOnly,$skipNew,$skipOld,$excludeDeps,$optXDependingFor,$optXBlockingFor);
+my ($optDebugGCP, $optDebugGRCP);
+$ENV{LANG} = 'C';
+$ENV{LC_COLLATE} = 'C';
+delete $ENV{RELEASE} if (exists($ENV{RELEASE}) && ($ENV{RELEASE} =~ m/RHEL/));
+$oldFileNotFound = 0 ; $newFileNotFound = 0;
+$optXDependingFor = 0 ; $optXBlockingFor = 0;
+$optDebugGCP = 0; $optDebugGRCP = 0;
+sub doHelp {
+    my ($rc) = @_;
+    $rc = 0 if (!defined($rc));
+    print STDERR <<EOF;
+Usage:
+  tps-make-lists [[-e] errata-number [[-r] release [[-a ] arch]]]
+  -a, --arch       Architecture to use (default: this machine)
+  -c, --channels   Comma-separated list of RHN channels that should be
+                   examined, regardless of the actual current subscriptions.
+  -d, --dep-errata List of dependent errata, comma-separated, in YYYY:NNNN format.
+  -e, --erratum    Advisory number, in YYYY:NNNN format.
+  -h, --help       You are looking at it.
+  -l, --logfile    Specify logfile (default ./tps-make-lists.log)
+  -r, --release    Release to use (default: this machine)
+  -f, --reportfile Specify reportfile (default ./tps-make-lists.report)
+  -v, --verbose    Provide verbose debugging information
+  -n, --no-logfile Do not generate logfiles, just use standard error.
+  -o, --output-dir Output directory for all files, default: current directory.
+  -p, --primary-only  Do not process any dependent errata.
+  -x, --exclude-dep   Exclude comma-separated list of dependent errata.
+     --exclude-depending-for  Do not query the Errata Tool's depending_errata_for API
+     --exclude-blocking-for   Do not query the Errata Tool's blocking_errata_for API
+     --force-et-release       Force use of the given string as an Errata Tool Release,
+                              perhaps useful when running on a different box than
+                              the erratum is intended for.
+     --skip-new    Do not fetch lists for new packages; re-process existing ones.
+     --skip-old    Do not fetch lists for old packages; re-process existing ones.
+
+Note:
+  -d and -p may be specified together, in which case only the dependent
+  errata specified will be used.  Otherwise, any dependencies that the
+  dependent errata have will also be used.
+
+Examples:
+  tps-make-lists 2009:6666
+  tps-make-lists -a ia64 -r 4AS -e 2009:6666
+  tps-make-lists 2009:6666 4AS-4.7.z s390x
+  tps-make-lists -d 2010:6666,2010:6667 2010:9999 4AS-4.7.z s390x
+  tps-make-lists -d 2010:6666,2010:6667 -x 2011:0666,2011:9666 2011:9999
+  tps-make-lists 2010:6666 -c rhel-i386-client-workstation-5,rhel-i386-client-5
+EOF
+    exit $rc;
+}
+### Intentionally Undocumented:
+#  "debug-gcp",\$optDebugGCP,
+#     Use files instead of calling ET's get_channel_packages
+#  "debug-grcp",\$optDebugGRCP,
+#     Use files instead of calling ET's get_released_channel_packages
+#   If $ENV{TPSDEBUG_SAVE_ET_PKGS} is set, the returns from ET will be saved.
+#   Filenames are:  et-{new,old}-$ADVISORY.txt
+# Users should not be using these features; they're solely for testing and
+# debugging.  Thus the lack of advertising/docs.
+
+# invoked from main()
+sub my_init {           
+    # Should probably allow omission of $release, as it may be guessed
+    # by combining redhat-release info with errata channel info.
+    GetOptions(
+        "arch|a=s",\$arch,
+        "erratum|e=s",\$erratum,
+        "channels|c=s",\$channelArg,
+        "dep-errata|d=s",\$errataArg,
+        "force-et-release=s",\$forceETRelease,
+        "help|h", \$help,
+        "logfile|l=s", \$logfile,
+        "no-logfile|n", \$no_logs,
+        "output-dir|o=s", \$outDir,
+        "primary-only|p",\$primaryOnly,
+        "release|r=s",\$release,
+        "reportfile|f=s", \$reportfile,
+        "skip-new",\$skipNew,
+        "skip-old",\$skipOld,
+        "exclude-dep|x=s", \$excludeDeps,
+        "exclude-depending-for",\$optXDependingFor,
+        "exclude-blocking-for",\$optXBlockingFor,
+        "debug-gcp",\$optDebugGCP,
+        "debug-grcp",\$optDebugGRCP,
+        "verbose|v", \$debug,
+    ) || doHelp(0);
+
+    doHelp(0) if ($help);
+
+    $debug = 0 if (!defined($debug));
+    $errataArg = '' if (!defined($errataArg));
+    $primaryOnly = 0 if (!defined($primaryOnly));
+    $foundReleasedPackages = 0;
+
+    my $initHelpers = {};
+
+    ## First, deal with any positional and implicit arguments.
+    ## Then have tps-lib fill in any remaining information.
+    ## Take a fatal error if anything couldn't be determined after that.
+    my $erratumByDir = `basename \$(dirname \$PWD) | grep -sE \'^[[:digit:]]{4}:[[:digit:]]{4,5}\$\'`;
+    chomp($erratumByDir);
+    if (!defined($erratum) || (!$erratum) ||
+        !defined($release) || (!$release) ||
+        !defined($arch)    || (!$arch)
+        ) {
+        my $argCnt = scalar(@ARGV);
+        $erratum = '' if (!defined($erratum));
+        $release = '' if (!defined($release));
+        $arch = '' if (!defined($arch));
+        if (3 == $argCnt) {
+            ($erratum,$release,$arch) = @ARGV;
+        } elsif (2 == $argCnt) {
+            if ($arch) {
+                ($erratum,$release) = @ARGV;
+            } elsif ($erratum) {
+                ($release,$arch)    = @ARGV;
+            } elsif ($release) {
+                ($erratum,$arch)    = @ARGV;
+            } else {
+                ($erratum,$release) = @ARGV;
+            }
+        } elsif (1 == $argCnt) {
+            if (!$erratum) {
+                ($erratum) = @ARGV;
+            } elsif (!$release) {
+                ($release) = @ARGV;
+            } elsif (!$arch) {
+                ($arch) = @ARGV;
+            }
+        } else {
+            if (!$erratum) {
+                $erratum = $ENV{ERRATA} || $ENV{TPSQ_ERRATA} || '';
+                if (!$erratum && ($erratumByDir =~ m/^\d\d\d\d:\d\d\d\d{1,2}$/)) {
+                    $erratum = $erratumByDir;
+                }
+            }
+        }
+        if (!$erratum) {
+            # fatal error
+            logTestFatal("Error: cannot determine advisory number\n");
+            doHelp(1);
+        }
+        if (!$release) {
+            $release = $ENV{TPSQ_RELEASE} || getTpsQInfo($erratum,$channelArg) || $ENV{RELEASE} || '';
+        }
+        if (!$arch) {
+            $arch = $ENV{ARCH} || $ENV{TPSQ_ARCH} || $globs->{arch} || '';
+            # n.b. that $globs->{truearch} should also exist
+        }
+    }
+
+    if ($erratum) {
+        $initHelpers->{tpsErratum} = $erratum;
+    }
+    if ($release) {
+        $initHelpers->{tpsProductVer} = $release;
+    }
+    if ($arch) {
+        $initHelpers->{arch} = $arch;
+        # $initHelpers->{trueArch} = $arch;
+    }
+    $outDir = '.' unless ($outDir);
+    @channelArgList = ();
+    @channelArgList = split(/,/,$channelArg) if (defined($channelArg));
+    @excludeDepList = ();
+    @excludeDepList = split(/,/,$excludeDeps) if (defined($excludeDeps));
+
+    ################ TPS INITIALIZATION ##############
+    $globs = initTpsLibVars($initHelpers);
+
+    $arch = $globs->{arch} unless ($arch);
+    $release = $globs->{tpsProductVer} unless ($release);
+    $globs->{verbose} = 1 if ($debug);
+    $logfile = "$outDir/tps-make-lists.log" unless ($logfile);
+    $reportfile = "$outDir/tps-make-lists.report" unless ($reportfile);
+    if (defined($no_logs) && $no_logs) {
+        openLogFileSet('>/dev/null',\*STDERR,'>/dev/null','>/dev/null');
+    } else {
+        openLogFileSet((">$outDir/tps-make-lists.raw"),\*STDERR,">$reportfile",">$logfile");
+    }
+    $PrimaryErratum = $globs->{tpsErratum};
+    standardTpsIntro();
+    ################ TPS LOGS ACTIVE ##############
+
+    if (defined($forceETRelease) && $forceETRelease) {
+        # Note: using $release for ETRelease is seldom good if you're running on a different box;
+        # for instance, grabbing -e 2009:9124 -a x86_64 -r 4AS on a Fedora system.  Best to
+        # be able to say "I really mean 4AS-cluster" or whatever.
+        doLog($TPSINFO,$TPSLOG,("TPSINFO: overriding ETRelease $globs->{tpsETRelease} with supplied arg:  ".
+                                "$forceETRelease\n"));
+        $globs->{tpsETRelease} = $forceETRelease;
+    }
+
+    if ($release && ($release eq $arch)) {
+        # somebody said "makelists $erratum $arch"
+        print STDERR "error: erratum $erratum release $release arch $arch\n";
+        doHelp(1);
+    }
+}
+
+# getTpsQInfo:  fetch and apply information from ET's get_tps_txt API
+# Inputs:  
+#  advisory number, optional comma-separated list of channels
+# Effects: 
+#  sets TPSQ_RELEASE and (if not already set) TPSQ_RHNDEST in the environment.
+# Returns: 
+#  '' on error, or Errata Tool's RELEASE string on success.
+# Notes:
+#  Failures are silent, as this routine executes before logfiles are open.
+#  The caller is expected to have a backup plan if this routine returns ''.
+sub getTpsQInfo($;$) {
+    my ($advisory,$fromChannels) = @_;
+    my $ret = '';
+    my $extraArg = '';
+    $extraArg = '-q' if ($ENV{TPSQ_RHNQA} && ('true' eq $ENV{TPSQ_RHNQA}));
+    if ((defined($fromChannels)) && ($fromChannels)) {
+        $extraArg .= " -c $fromChannels";
+    }
+    # FIXME: should probably run tps-query -s and get the index of the "release" string
+    # and then use that.  For now, just hardcode the thing.
+    # $ ./tps-query -s
+    # advisory_tag runid jobid advisory_type advisory_id respins release arch rhn_dest is_rhnqa cache_mtime
+    my $cmdOut = `${RealBin}/tps-query $extraArg -g $advisory`;
+    if (0 == $?) {
+        my @parsed = split(/\s+/, $cmdOut);
+        $ENV{TPSQ_RELEASE} = $parsed[6];
+        $ENV{TPSQ_RHNDEST} = $parsed[8] unless (defined($ENV{TPSQ_RHNDEST}) && $ENV{TPSQ_RHNDEST});
+        $ret = $ENV{TPSQ_RELEASE};
+    }
+    return $ret;
+}
+
+sub defFileNames($$) {
+    my ($release,$arch) = @_;
+    my %h_ash;
+    my $ret = \%h_ash;
+    my ($newbase,$oldbase,$namebase,$files_out,$srcchunk,$filechunk,$oldbase,$obsbase,$reqbase,$depchunk);
+
+    $newbase = 'new';
+    # most recently shipped files associated w/errata
+    $oldbase = 'old';
+    # for Obsoletes/Requires
+    $obsbase = 'obs';
+    $reqbase = 'req';
+    # %{NAME}-only for packages (will also have {OLD,NEW,OBS,REQ}BASE appended)
+    $namebase = 'pkgnames';
+    # text that indicates a list of SRPMs
+    $srcchunk = 'src';
+    # text that indicates a list of binary or noarch RPMs
+    $filechunk = 'files';
+    # text that indicates that info is for a dependent erratum (--dep-errata)
+    $depchunk = 'dep';
+
+    $ret->{ALL_NEW} = "${newbase}-ALL.list";
+
+#    DEP_SRC_OUT DEP_FILES_OUT DEP_OLDSRC_OUT DEP_OLDFILES_OUT
+#    DEP_PKGNAMES_OUT DEP_OLDPKGNAMES_OUT
+
+    # Lists of SRPMS
+    $ret->{SRC_OUT} = "${newbase}-${srcchunk}-${release}-${arch}.list";
+    $ret->{DEP_SRC_OUT} = "${newbase}-${depchunk}-${srcchunk}-${release}-${arch}.list";
+    $ret->{OLDSRC_OUT} = "${oldbase}-${srcchunk}-${release}-${arch}.list";
+    $ret->{DEP_OLDSRC_OUT} = "${oldbase}-${depchunk}-${srcchunk}-${release}-${arch}.list";
+    $ret->{BUILD_REQ_INFO} = "${newbase}-buildreqs.txt";
+    $ret->{BUILD_REQ_MISSING} = "${newbase}-buildreqs-missing.list";
+
+    # List of binary RPMs (possibly noarch/multilib/etc)
+    $ret->{FILES_OUT} = "${newbase}-${filechunk}-${release}-${arch}.list";
+    $ret->{DEP_FILES_OUT} = "${newbase}-${depchunk}-${filechunk}-${release}-${arch}.list";
+    $ret->{FILES_OUT_TMP} = "$ret->{FILES_OUT}.tmp";
+    $ret->{OLDFILES_OUT} = "${oldbase}-${filechunk}-${release}-${arch}.list";
+    $ret->{DEP_OLDFILES_OUT} = "${oldbase}-${depchunk}-${filechunk}-${release}-${arch}.list";
+    $ret->{OBSFILES_OUT} = "${obsbase}-${filechunk}-${release}-${arch}.list";
+
+    # List of plain %{NAME}s
+    $ret->{PKGNAMES_OUT} = "${namebase}-${newbase}-${release}-${arch}.list";
+    $ret->{DEP_PKGNAMES_OUT} = "${namebase}-${depchunk}-${newbase}-${release}-${arch}.list";
+    $ret->{OLDPKGNAMES_OUT} = "${namebase}-${oldbase}-${release}-${arch}.list";
+    $ret->{DEP_OLDPKGNAMES_OUT} = "${namebase}-${depchunk}-${oldbase}-${release}-${arch}.list";
+    $ret->{OBSPKGNAMES_OUT} = "${namebase}-${obsbase}-${release}-${arch}.list";
+    $ret->{PROVIDES_OUT} = "new-provides-${release}-${arch}.list";
+    $ret->{SRPM_REQ_UPGRADE} = "rpmbuild-requires-upgrade.list";
+    foreach my $fn (sort(keys(%$ret))) {
+        $ENV{$fn} = $ret->{$fn};
+    }
+    return $ret;
+}
+
+sub getNewPkgsByChannel($$;$) {
+    my ($advisory,$channel,$chHash) = @_;
+    my @ret = ();
+
+    $chHash = getPkgHashKeyedByChannels(0,$advisory,$optDebugGCP) if (!defined($chHash));
+    if (exists($chHash->{channel})) {
+        my $t = $chHash->{channel};
+        return @$t;
+    }
+    return @ret;
+}
+
+sub hashifySingleRpm($$$) {
+    my ($listType,$forErratum,$item) = @_;
+    my $nosig = '';
+    my $forPrimary = (($forErratum eq $PrimaryErratum) ? 1 : 0);
+    my $ret = { item => $item, valid => 0, type => $listType, isPrimary => $forPrimary, erratum => $forErratum };
+    my $p = 'p'; # rpm -p <package>, but omitted if the query is about an installed rpm.
+
+    $nosig = '--nosignature' if (0 == $globs->{is21});
+
+    if (! -r $item) {
+        if ('.' eq dirname($item)) {
+            $p = '';  # query installed rpm
+        } else {
+            # error: cannot read file
+            # Sometimes the signed version has been garbage-collected by RelEng,
+            # but the unsigned version can still be used.
+            # FIXME: FUTUREFEATURE: fetch from download.devel.redhat.com if possible
+            doLog($TPSERROR,$TPSLOG,"ERROR: cannot read ${listType}-list file: $item\n");
+            my $altItem = `find_package \$(basename "$item")`;
+            return $ret if ((0 != $?) || ($altItem =~ m/ERROR:/));
+            chomp($altItem);
+            if (verifySubstitution($item,$altItem,$listType)) {
+                # Use the copy of the RPM that we found instead of the (missing!) one on
+                # the path that was provided to us.
+                doLog($TPSINFO,$TPSLOG,"INFO: using alternative ${listType}-list file: $altItem\n");
+                $item = $altItem;
+                $ret->{item} = $item;
+            } else {
+                ##### FIXME: SHOULD THIS FAIL THE ENTIRE RUN?  SEE BZ 616030.
+                # Flag the problem for later reporting -- at least one of the
+                # input files cannot actually be used!
+                $newFileNotFound = 1 if ($listType eq 'new');
+                $oldFileNotFound = 1 if ($listType eq 'old');
+                doLog($TPSWARN,$TPSLOG,"WARNING: discarding ${listType}-list file: $item\n");
+                return $ret;
+            }
+        }
+    }
+    # NB: Order of hashkeys must match exactly the rpm query for $info.
+    my @rpm_hashkeys = qw{n v r a md5 epoch srpm is_src sha1 rsa gpg pgp insttime rpmversion};
+    my $info = doRpmCommand("rpm -q$p $nosig --qf '%{NAME}\n%{VERSION}\n%{RELEASE}\n%{ARCH}\n%{SIGMD5}\n%{EPOCH}\n%{SOURCERPM}\n%{SOURCEPACKAGE}\n%{SHA1HEADER}\n%{RSAHEADER}\n%{SIGGPG}\n%{SIGPGP}\n%{INSTALLTIME}\n%{RPMVERSION}\n' $item 2>&1");
+    my $keyCount = 1 + @rpm_hashkeys;
+
+    if ($info =~ m/^error:/i) {
+        # FIXME: IMPROVE ERROR HANDLING
+        doLog($TPSERROR,$TPSLOG,"ERROR: rpm failure on $item: $info\n");
+        return $ret;
+    }
+
+    my $curKeyNum = 0;
+    foreach my $nugget (split(/\n/,$info,$keyCount)) {
+        chomp($nugget);
+        $ret->{$rpm_hashkeys[$curKeyNum]} = $nugget;
+        $curKeyNum++;
+    }
+    # Mark SRPM as arch "src" if applicable
+    $ret->{a} = 'src' if (($ret->{is_src}) == 1);
+
+    # Try to get some info about signatures.  Note the different offsets.
+    $ret->{sign_key} = '(none)';
+    $ret->{sign_key_type} = '(none)';
+    if ($ret->{rsa} ne '(none)') {
+        my $tmp = $ret->{rsa};
+        if (length($tmp) > 36) {
+            $ret->{sign_key} = substr($tmp,28,8);
+            $ret->{sign_key_type} = 'RSA';
+        }
+    }
+    if (($ret->{sign_key} eq '(none)') && ($ret->{gpg} ne '(none)')) {
+        my $tmp = $ret->{gpg};
+        if (length($tmp) > 36) {
+            $ret->{sign_key} = substr($tmp,26,8);
+            $ret->{sign_key_type} = 'GPG';
+        }
+    }
+    if (($ret->{sign_key} eq '(none)') && ($ret->{pgp} ne '(none)')) {
+        my $tmp = $ret->{pgp};
+        if (length($tmp) > 36) {
+            $ret->{sign_key} = substr($tmp,28,8);
+            $ret->{sign_key_type} = 'PGP';
+        }
+    }
+    # Process the conflicts, obsoletes, requires, and provides info...
+    foreach my $i (qw{ conflicts obsoletes requires provides }) {
+        $info = doRpmCommand("rpm -q$p $nosig --$i $item 2>&1 | sort | uniq");
+        my @arr = split(/ *\n/,$info);
+        $ret->{$i} = \@arr;
+    }
+
+    # setup name.arch and epoch:version-release strings
+    # for quick finds and rpm version comparisons
+    $ret->{na} = "$ret->{n}.$ret->{a}";
+    $ret->{na_okay} = 1;
+    my $eppy = 0;
+    $eppy = $ret->{epoch} unless ($ret->{epoch} eq '(none)');
+    $ret->{evr} = "$eppy:$ret->{v}-$ret->{r}";
+
+    $ret->{valid} = 1;
+    return $ret;
+}
+sub hashifyRpmList ($$$) {
+    my ($listType,$listRef,$forErratum) = @_;
+    my $ret = {};
+    my %seen;
+    my %seenByName;
+    my $single;
+
+    foreach my $i (@$listRef) {
+        unless (exists($seenByName{$i})) {
+            $single = hashifySingleRpm($listType,$forErratum,$i);
+            if (1 == $single->{valid}) {
+                $ret->{$i} = $single;
+                if (1 == $seen{$single->{md5}}) {
+                    $single->{dup_md5} = 1;
+                } else {
+                    $single->{dup_md5} = 0;
+                    $seen{$single->{md5}} = 1;
+                }
+            }
+            # Errors are reported by hashifySingleRpm.
+            # Silently ignore invalid items here.
+
+            # The incoming list might have duplicates,
+            # so don't waste time with those...
+            $seenByName{$i} = 1;
+        }
+    }
+    return $ret;
+}
+sub playGuessTheETAbbreviation($$) {
+    my ($rel,$chan) = @_;
+    my $ret;
+    chomp($rel);
+    chomp($chan);
+    $ret = $rel;
+    if ($chan =~ m/(-\d+\.\d+\.z)(-.*)*/i) {
+        my ($z,$zExt) = ($1,($2 || ''));
+        return "$rel$z$zExt";
+    }
+    my $val;
+    my %kludgery = {
+        '-gfs-' => '-GFS',
+        '-cluster-storage-5' => '',
+        '-cluster.*-5$' => '',
+        'as-3-cluster' => '-CS',
+        '-extras' => '-LACD',
+        '-stronghold-' => 'SH4-',
+        '-appstk-1' => '-RHWAS',
+        '-appstk-2' => '-Stacks',
+        '-rhaps-2' => '-RHAPS2',
+        '-rhaps$' => '-RHAPS',
+        '-hwcert' => '-HWCERT2',
+        '-server-vt-' => '-VT',
+        'as-4-rhdirserv-' => '-DirServ',
+    };
+    foreach my $k (keys(%kludgery)) {
+        if ($chan =~ m/$k/) {
+            $val = $kludgery{$k};
+            last;
+        }
+    }
+    if (defined($val)) {
+        if ($val =~ m/-$/) {
+            $ret = "$val$rel";
+        } else {
+            $ret = "$rel$val";
+        }
+    }
+    return $ret;
+}
+sub neRule($$) {
+    my ($one,$two) = @_;
+    return ($one ne $two);
+}
+sub eqRule($$) {
+    my ($one,$two) = @_;
+    return ($one eq $two);
+}
+sub createOutFile($$$$$$) {
+    my ($fLabel,$listRef,$rule,$toPrint,$unDup,$isPrimary) = @_;
+    my $outFile = $fNames->{$fLabel};
+    my $outFileFull = "$outDir/$outFile";
+    my $tFailCount = 0;
+    my $written = 0;
+    my $writeMe;
+    if (open(OUT,">$outFileFull")) {
+        if (0 == $unDup) {
+            foreach my $hr (@$listRef) {
+                next unless (($isPrimary < 0) || ($hr->{isPrimary} == $isPrimary));
+                if (&$rule($hr->{a},'src')) {
+                    $writeMe = $hr->{$toPrint};
+                    chomp($writeMe);
+                    print OUT "$writeMe\n";
+                    $written++;
+                }
+            }
+        } else {
+            my (%h,$i);
+            foreach my $hr (@$listRef) {
+                next unless (($isPrimary < 0) || ($hr->{isPrimary} == $isPrimary));
+                $i = $hr->{$toPrint};
+                if (&$rule($hr->{a},'src')) {
+                    $h{$i} = 1;
+                }
+            }
+            foreach my $k (sort(keys(%h))) {
+                chomp($k);
+                print OUT "$k\n";
+                $written++;
+            }
+        }
+        close(OUT);
+        my $s = ((1 == $written) ? '' : 's');
+        doLog($TPSTXT,$TPSLOG,"Wrote $written item$s to $outFile\n");
+    } else {
+        doLog($TPSFAILTXT,$TPSRPT,"Cannot save $outFile to $outDir: $!\n");
+        $tFailCount++;
+    }
+    return $tFailCount;
+}
+## Now uses routine to call the ET to ask about depErrata.
+## <jorris> jwl_h: It is /errata/blocking_errata_for
+# Inputs:
+#   @errataList: list of errata, [0] is the primary
+#   $errataArg: comma-sep list of user-supplied dep errata
+#   $primaryOnly: whether to ignore dependent errata
+# Outputs:  modifies @errataList to add any dep errata.
+sub getDepErrata($$$$$$) {
+    my ($eList,$eString,$doOnlyPrimary,$excludeRef,$noDepFor,$noBlockFor) = @_;
+    return if ((1 == $doOnlyPrimary) && (!$eString));
+    my (%seen,$tmp,$primary);
+    my $seenVal = 0;
+    $seenVal = 1 if ($doOnlyPrimary);
+    $tmp = $eList->[0];
+    $primary = $tmp;
+    $seen{$tmp} = $seenVal;
+    my @adds = split(/,/, $eString);
+    foreach my $s (@adds) {
+        # push(@$eList,$s) if ($s);
+        $seen{$s} = $seenVal;
+    }
+    # This next loop is intended to query for all possible
+    # dependent errata.  Values are 1 for already queried, 0 for not.
+    my $ET_URL = "http://$ENV{ERRATA_XMLRPC}/errata";
+    my $A_BEF  = "blocking_errata_for";  # ET's "Depends On" field
+    my $A_DEF  = "depending_errata_for"; # ET's "Blocks" field
+    my $check_for_new = 1;
+    my ($fetch1_worked, @lines1);
+    my ($fetch2_worked, @lines2);
+    my ($afetch_worked, @lines);
+    while ($check_for_new) {
+        $check_for_new = 0;
+        foreach my $advisory (keys(%seen)) {
+            if (0 == $seen{$advisory}) {
+                @lines = ();
+                $afetch_worked = 0;
+                $fetch1_worked = 0; $fetch2_worked = 0;
+                unless ($noBlockFor) {
+                    doLog($TPSCMD,$TPSDEBUG,"Fetching BEF: $ET_URL/$A_BEF/$advisory\n");
+                    ($fetch1_worked, @lines1) = fetchUrl("$ET_URL/$A_BEF/$advisory", 'text/plain');
+                }
+                unless ($noDepFor) {
+                    doLog($TPSCMD,$TPSDEBUG,"Fetching DEF: $ET_URL/$A_DEF/$advisory\n");
+                    ($fetch2_worked, @lines2) = fetchUrl("$ET_URL/$A_DEF/$advisory", 'text/plain');
+                }
+
+                if ($fetch1_worked) {
+                    # A_BEF = ET "Depends On"
+                    $afetch_worked = 1;
+                    foreach my $x (split(/,/,(join(",",@lines1)))) {
+                        unless (listInclude($excludeRef,$x)) {
+                            push @lines, $x;
+                            chomp($x);
+                            doLog($TPSLOG,$TPSTIP,"Discovered Errata Tool 'Depends On' advisory: will add files from: $x\n");
+                        }
+                    }
+                }
+                if ($fetch2_worked) {
+                    # A_DEF = ET "Blocks"
+                    $afetch_worked = 1;
+                    foreach my $x (split(/,/,(join(",",@lines2)))) {
+                        unless (listInclude($excludeRef,$x)) {
+                            push @lines, $x;
+                            chomp($x);
+                            doLog($TPSLOG,$TPSTIP,"Discovered Errata Tool 'Blocks' advisory: will add files from: $x\n");
+                        }
+                    }
+                }
+
+                # Do not re-try any failed fetches.
+                # FIXME/RFE: do a limited number of re-tries in case ET is having issues.
+                $seen{$advisory} = 1;
+
+                if ($afetch_worked) {
+                    foreach my $l (@lines) {
+                        chomp($l);
+                        @adds = split(/,/, $l);
+                        foreach my $a (@adds) {
+                            chomp($a);
+                            if ($a) {
+                                if (!exists($seen{$a})) {
+                                    $seen{$a} = 0;
+                                    $check_for_new = 1;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    doLog($TPSLOG,$TPSWARN,
+                          "Did not fetch dependent errata info for: $ET_URL/$A_BEF/$advisory or $A_DEF -- continuing anyway.\n");
+                    doLog($TPSLOG,$TPSTIP,
+                          "If this erratum depends on others, you might want to re-run tps-make-lists.\n");
+                }
+            }
+        }
+    }
+
+    # Now collect the advisories we've seen. $primary is already there.
+    foreach my $advisory (keys(%seen)) {
+        if (($advisory) && ($advisory ne $primary)) {
+            push(@$eList,$advisory);
+            doLog($TPSMISC,$TPSDEBUG,"Added dependent erratum: $advisory\n");
+        }
+    }
+    return;
+}
+sub findObsoletes($$$) {
+    my ($newPkgsList,$oldPkgsList,$masterList) = @_;
+    my ($pkg,$out,@outList);
+    my ($p,$pp,@ppList,$ppp,$p2,$rc,$queryThis,$fullPkg,$obsCount);
+    my (%addToOld,@addToOldList,$pkgEntry,%pkgEntries,%seenIt);
+    $obsCount = 0;
+
+    my $FindObsolete = '/usr/local/bin/find_package';
+
+    my $qf2 = '%{name} %{version} %{release} %{arch}\n';
+    my $qf = '%{name}-%{version}-%{release}';
+    my $nosig = ((1 == $globs->{is21}) ? '' : '--nosignature');
+    $qf .= '.%{arch}' if (0 == $globs->{is21});
+    $qf .= '\n';
+
+    HR: foreach my $hr (@$newPkgsList) {
+        $pkg = $hr->{item};
+        doLog($TPSCMD,$TPSDEBUG,"findObs: rpm -q --obsoletes $nosig -p \"$pkg\"\n");
+        $out = `rpm -q --obsoletes $nosig -p "$pkg" 2>&1`;
+        doLog($TPSCMDOUT,$TPSDEBUG,"$out\n");
+        @outList = split(/\n/,$out);
+        OO: foreach my $o (@outList) {
+            # eliminate any trailing whitespace first...
+            $o =~ s/\s+$//;
+            if ($o eq '(none)') {
+                my @newNames = map { $_->{n} } @$newPkgsList;
+                next OO if (isKernel(\@newNames));
+                $o = $hr->{n};
+            }
+            next OO if (!$o);
+            $rc = 0;
+            $p = `rpm -q $nosig --qf "$qf" "$o"`;
+            if (0 != $?) {
+                $p = `echo -E "$p" ; rpm -q $nosig --qf "$qf" --whatprovides "$o" 2>&1`;
+                $rc = $?;
+            }
+            if (0 == $rc) {
+                $queryThis = $o;
+                @ppList = grep(!/(not installed)|(no package prov)/,
+                               split(/\n/,$p));
+                PP: foreach $pp (@ppList) {
+                    chomp($pp);
+                    next PP unless ($pp);
+                    next PP if (exists($seenIt{$pp}));
+                    $seenIt{$pp} = 1;
+
+                    doLog($TPSCMD,$TPSDEBUG,"rpm -q $nosig --qf \"$qf2\" \"$pp\"\n");
+                    $ppp = `rpm -q $nosig --qf "$qf2" "$pp"`;
+                    chomp($ppp);
+                    doLog($TPSCMDOUT,$TPSDEBUG,"$ppp\n");
+                    doLog($TPSCMD,$TPSDEBUG,"$FindObsolete $ppp 2>/dev/null\n");
+                    $fullPkg = `$FindObsolete $ppp 2>/dev/null`;
+                    $rc = $?;
+                    doLog($TPSCMDOUT,$TPSDEBUG,"$fullPkg\n");
+                    if (0 == $rc) {
+                        ## FIXMEFIXMEFIXME FIXME: use $globs->{newlyReleasedInfo}
+                        ## to ensure that the installed package is legit.
+                        ## Or is it guaranteed legit since find_package found it?
+                        WW: foreach my $w (split(/\n/,$fullPkg)) {
+                            chomp($w);
+                            next WW unless ($w);
+                            next WW unless (-r $w);
+                            # Now, if we don't already have that file on the list, add it.
+                            # if (0 == scalar(map { $_->{item} eq $w } @$oldPkgsList)) {
+                            my $fnd = 0;
+                            foreach my $z (@$oldPkgsList) {
+                                if (($z->{item} eq $w) || (basename($z->{item}) eq basename($w))) {
+                                    $fnd = 1;
+                                    last;
+                                }
+                            }
+                            if (0 == $fnd) {
+                                $addToOld{$w} = 1;
+                                # And tell the world, just in case GRP failed and we
+                                # want to override that.
+                                $globs->{tml_detectedOldObsFile} = 1;
+                                doLog($TPSMISC,$TPSDEBUG,
+                                      "AddToOld: $w\ndetectedOldObsFile: $globs->{tml_detectedOldObsFile}\n");
+                                ## FIXME: should we also try to find any old SRPM here?
+                            }
+                        }
+                        $queryThis = $pp;
+                    } else {
+                        doLog($TPSMISC,$TPSDEBUG,"$FindObsolete failed with \"$ppp\":\n$fullPkg\n");
+                    }
+                }
+                $pkgEntry = `rpm -q $nosig --qf '%{name}\n' "$queryThis" 2>/dev/null | sort | uniq`;
+            } else {
+                # $p is some msg like "package FOO is not installed"
+                $pkgEntry = (split(/\n/,$p))[0];
+                $pkgEntry =~ s/is not installed//;
+                $pkgEntry =~ s/^package //;
+            }
+            chomp($pkgEntry);
+            $pkgEntries{$pkgEntry} = 1 if ($pkgEntry);
+        }
+    }
+    # %pkgEntries is the basis for OBSPKGNAMES_OUT.
+    my $foundIt;
+    foreach my $a (keys(%addToOld)) {
+        $foundIt = 0;
+        map { $foundIt = 1 if $_->{item} eq $a; } @$oldPkgsList;
+        push @addToOldList,$a unless ($foundIt);
+    }
+    my @obsHashList = ();
+    my $obsHash = hashifyRpmList('obs',\@addToOldList,0); # returns hashref keyed by filepaths
+    foreach my $a (keys(%$obsHash)) {
+        push @obsHashList,$obsHash->{$a};
+    }
+    foreach my $a (@obsHashList) {
+        $foundIt = 0;
+        map { $foundIt = 1 if $_->{md5} eq $a->{md5}; } @$oldPkgsList;
+        unless ($foundIt) {
+            map { $foundIt = 1 if $_->{md5} eq $a->{md5}; } @$newPkgsList;
+        }
+        # if we did not find released packages, we might have leftovers
+        # from a respin, or pre-errata test packages.  Do not count those
+        # as Obsoletes.  See BZ 570791.
+        if ((0 == $foundIt) && (0 == $foundReleasedPackages)) {
+            map { $foundIt = 1 if $_->{n} eq $a->{n}; } @$oldPkgsList;
+            unless ($foundIt) {
+                map { $foundIt = 1 if $_->{n} eq $a->{n}; } @$newPkgsList;
+            }
+        }
+        unless ($foundIt) {
+            push @$oldPkgsList,$a;
+            push @$masterList,$a;
+            doLog($TPSTXT,$TPSLOG,"Added to Obsoletes: $a->{item}\n");
+            $obsCount++;
+        }
+    }
+    doLog($TPSTXT,$TPSLOG,"Initial Population for Obsoletes List: $obsCount\n");
+    doLog($TPSTXT,$TPSLOG,("Additional Obsoletes Items: " .
+                           scalar(keys(%pkgEntries)) . ":\n"));
+    foreach my $a (sort(keys(%pkgEntries))) {
+        next if ($a =~ m/^\s*$/);
+        chomp($a);
+        doLog($TPSTXT,$TPSLOG,"  $a\n");
+    }
+    return \%pkgEntries;
+}
+###########################
+# gatherBuildReqs: determine whether a package upgrade is needed for the SRPM test.
+# Written generically so it can be put into tps-lib and called from either
+# tps-make-lists or tps-srpmtest, as desired.
+# Inputs: (relative) path to tps files
+#         boolean: whether to announce the count of lines written
+#         AREF: to master list (LoH containing provides/requires info), or '' if unavailable
+# Outputs: PASS or FAIL
+sub gatherBuildReqs($$$) {
+    my ($fDir,$doAnnounce,$masterRef) = @_;
+    my @reqFiles = qw{ SRC_OUT PKGNAMES_OUT PROVIDES_OUT OLDPKGNAMES_OUT FILES_OUT };
+    my @createFiles = qw{ BUILD_REQ_INFO BUILD_REQ_MISSING SRPM_REQ_UPGRADE };
+    my %reqFP;
+    my $nosig = ((1 == $globs->{is21}) ? '' : '--nosignature');
+    my $rc = 'FAIL';
+
+    foreach my $r (@reqFiles) {
+        if (!exists($ENV{$r})) {
+            doLog($TPSFAILTXT,$TPSLOG,"Cannot Determine file for: $r\n");
+            return $rc;
+        }
+        $reqFP{$r} = "$fDir/$ENV{$r}";
+        if (! -r $reqFP{$r}) {
+            doLog($TPSFAILTXT,$TPSLOG,"Cannot open file for: $r\n");
+            return $rc;
+        }
+    }
+    foreach my $r (@createFiles) {
+        if (!exists($ENV{$r})) {
+            doLog($TPSFAILTXT,$TPSLOG,"Cannot determine file for: $r\n");
+            return $rc;
+        }
+        $reqFP{$r} = "$fDir/$ENV{$r}";
+        unlink($reqFP{$r}) if (-r $reqFP{$r});
+    }
+    my $newSrcLinesR = fileToListRef($reqFP{SRC_OUT});
+    my $newPkgNamesR = fileToListRef($reqFP{PKGNAMES_OUT},$ENV{DEP_PKGNAMES_OUT});
+    my $newProvidesR = fileToListRef($reqFP{PROVIDES_OUT});
+    my $oldPkgNamesR = fileToListRef($reqFP{OLDPKGNAMES_OUT});
+    my $newPkgListR  = fileToListRef($reqFP{FILES_OUT},$ENV{DEP_FILES_OUT});
+    my @briLines = (); # Build_Req_Info
+    my @sruLines = (); # Srpm_Req_Upgrade
+    my $briLineCount = 0;
+    my $sruLineCount = 0;
+    foreach my $sp (sort(@$newSrcLinesR)) {
+        push @briLines, ("\n============ " . basename($sp) . " =================");
+        my $rpmReq = `rpm -q $nosig --requires -p "$sp"`;
+        my @rpmReqLines = split(/\n/,$rpmReq);
+        ####
+        #### FIXME: for 'pkg >= version', need to query installed and use rpm-vercmp
+        ####
+        foreach my $r (@rpmReqLines) {
+            chomp($r);
+            my ($j,$op,$k,$rubbish) = split(/\s+/,$r);
+            if ((defined($j)) && ($j)) {
+                map { push @briLines,$_ } (split(/\n/,`rpm -q $nosig --whatprovides "$j" 2>&1`));
+            }
+            if ((defined($k)) && ($k)) {
+                # Expected Requires: foo >= 1.2
+                # if j is in pkgnames_out and j-k is in files_out, add to SRU.
+                # or if "j = k" is in provides_out, add to SRU.
+                if ((scalar(grep(/^\Q$j\E$/,@$newPkgNamesR)) >= 1) &&
+                    (scalar(grep(m|/\Q$j\E-\Q$k\E|,@$newPkgListR)) >= 1)) {
+                    push @sruLines,$r;
+                } elsif (scalar(grep(m|^\s*\Q$j\E\s*=\s*\Q$k\E\s$|,@$newProvidesR)) >= 1) {
+                    push @sruLines,$r;
+                } elsif (1 <= scalar(grep(/^\s*\Q$j\E(\s*|$)/, @$newProvidesR))) {
+                    # Speculative add: could be a case of:
+                    #   Requires:  foo >= 2
+                    #   Provides:  foo = 4
+                    # This will need to be dealt with in editRequirements(), so add it here.
+                    push @sruLines,$r;
+                    doLog($TPSMISC,$TPSDEBUG,"sruLines: speculative add: $r\n") if ($debug);
+                }
+            } else {
+                # Expected Requires: foo
+                # if j is in pkgnames_out and j isn't in oldpkgnames_out and j isn't in SRU, add it.
+                if ((scalar(grep(/^\Q$j\E$/,@$newPkgNamesR)) >= 1) &&
+                    (scalar(grep(/^\Q$j\E$/,@$oldPkgNamesR)) < 1) &&
+                    (scalar(grep(/^\Q$j\E\s*$/,@sruLines)) < 1)) {
+                    push @sruLines,$r;
+                }
+            }
+        }
+    }
+    $briLineCount = scalar(@briLines);
+    $sruLineCount = scalar(@sruLines);
+    my $s;
+
+    my @nppLines = grep(/no package provides/,@briLines);
+    my %brmLines;
+    my $brmLineCount = 0;
+    foreach my $i (@nppLines) {
+        $i =~ s/no package provides\s*//;
+        $brmLines{$i} = 1 if ($i !~ m/rpmlib/);
+    }
+    my @missingReqs = sort(keys(%brmLines));
+    if ($masterRef) {
+        editRequirements($masterRef, \@sruLines, \@missingReqs);
+        $sruLineCount = scalar(@sruLines);
+    }
+
+    if (open(BRI,">$reqFP{BUILD_REQ_INFO}")) {
+        print BRI $_, "\n"              for @briLines;
+        close(BRI);
+        $s = ((1 == $briLineCount) ? '' : 's');
+        doLog($TPSTXT,$TPSLOG,"Wrote $briLineCount item$s to $ENV{BUILD_REQ_INFO}\n") if ($doAnnounce);
+    }
+    if (open(SRU,">$reqFP{SRPM_REQ_UPGRADE}")) {
+        print SRU $_, "\n"              for @sruLines;
+        close(SRU);
+        $s = ((1 == $sruLineCount) ? '' : 's');
+        doLog($TPSTXT,$TPSLOG,"Wrote $sruLineCount item$s to $ENV{SRPM_REQ_UPGRADE}\n") if ($doAnnounce);
+    }
+
+    if (open(BRM,">$reqFP{BUILD_REQ_MISSING}")) {
+        foreach my $i (@missingReqs) {
+            print BRM "$i\n";
+            $brmLineCount++;
+        }
+        close(BRM);
+        $s = ((1 == $brmLineCount) ? '' : 's');
+        doLog($TPSTXT,$TPSLOG,"Wrote $brmLineCount item$s to $ENV{BUILD_REQ_MISSING}\n") if ($doAnnounce);
+    }
+    if (0 == $brmLineCount) {
+        `touch $reqFP{BUILD_REQ_MISSING}`;
+    }
+    return 'PASS';
+}
+sub editRequirements($$$) {
+    my ($mastHRef,$sruLRef,$missingLRef) = @_;
+    my (@checkedMissing,@checkList,$pkgCap,$op,$val);
+    my @newSru = ();
+
+    # doLog($TPSTXT,$TPSLOG,"Hello from editRequirements\n");
+    foreach my $ln (@$missingLRef, @$sruLRef) {
+        next if (($ln =~ m/no package/i) || ($ln =~ m/rpmlib/));
+        $ln =~ s/^\s+//;  chomp($ln); $ln =~ s/\s+$//;
+        next unless ($ln);
+        ($pkgCap,$op,$val) = split(/\s+/,$ln);
+        # need to match against (ie) Provides: perl-Date-Manip = 5.54-4.el6 or perl(Date::Manip)
+	# doLog($TPSTXT,$TPSLOG,"editRequirements: findProv for req: $ln\n");
+        @checkList = findProvideInErrataLists($mastHRef,$pkgCap,$op,$val);
+        if (scalar(@checkList) < 1) {
+            # NOTE: The missing provide might be on the system or on RHN, but it's
+            # NOT in the advisory list of old|new primary|dependent RPMs.
+	    ### DEBUG ###
+	    # doLog($TPSTXT,$TPSLOG,"editRequirements: missing: $ln, zero checkList\n");
+            push @checkedMissing, $ln;
+        } else {
+	    my $t = $checkList[0];
+	    my $tmpStr = "$t->{n}-$t->{v}-$t->{r}.$t->{a}";
+	    ### DEBUG ###
+	    # doLog($TPSTXT,$TPSLOG,"editRequirements: checkList HIT (".scalar(@checkList)."): $ln, on $t->{type}:$tmpStr\n");
+	    my $rv = listHasHKeyWithVal(\@checkList,'type','old');
+            if ($rv) {
+                # For a Requires on the old*files list(s), it's no longer missing.
+                # (unless, of course, the new-files no longer provide it... but rpmdiff should report that.)
+		### DEBUG ###
+		# doLog($TPSTXT,$TPSLOG,"editRequirements: skipOld: $ln, on $rv->{type}: $rv->{n}-$rv->{v}-$rv->{r}.$rv->{a} \n");
+                next;
+            } else {
+                # the found item must be new, so onto sruLRef it goes.
+                # it will not be missing after a successful tps-upgrade.
+		### DEBUG ###
+		# doLog($TPSTXT,$TPSLOG,"editRequirements: PUSH sruLRef: $ln $tmpStr \n");
+                push @newSru, "$ln ## $tmpStr";
+                next;
+            }
+        }
+    }
+    ### DEBUG ###
+    # doLog($TPSINFO,$TPSRPT,("checkedMissing: ". Dumper(\@checkedMissing). "\n"));
+    # doLog($TPSINFO,$TPSRPT,("newSru: ". Dumper(\@newSru). "\n"));
+    ### DEBUG ###
+
+    @$sruLRef = @newSru;
+    @$missingLRef = @checkedMissing;
+}
+sub listHasHKeyWithVal($$$) {
+    my ($listRef,$key,$val) = @_;
+    foreach my $i (@$listRef) {
+        if (exists($i->{$key})) {
+	    if ("$i->{$key}" eq "$val") {
+		return $i;
+	    }
+        }
+    }
+    return 0;
+}
+sub checkOpTruth($$) {
+    my ($op,$cmpRes) = @_;
+    if ( (($op eq '>=') && ($cmpRes >= 0)) ||
+         (($op eq '>') && ($cmpRes > 0)) ||
+         (($op eq '<=') && ($cmpRes <= 0)) ||
+         (($op eq '<') && ($cmpRes < 0)) ||
+         (($op eq '!=') && ($cmpRes != 0)) ||
+         ((($op eq '=') || ($op eq '==')) && ($cmpRes == 0)) ) {
+        return 1;
+    }
+    return 0;
+}
+
+sub findProvideInErrataLists($$$$) {
+    # listRef here is the list of hashrefs that form files-master.xml
+    my ($listRef,$pkgCap1,$op1,$val1) = @_;
+    my ($pkgCap2,$op2,$val2, $cmpVal);
+    my @foundList = ();
+    foreach my $rec (@$listRef) {
+        if (exists($rec->{provides})) {
+            foreach my $p (@{$rec->{provides}}) {
+                ($pkgCap2,$op2,$val2) = split(/\s+/,$p);
+                if ($pkgCap1 eq $pkgCap2) {
+                    if (!$val1) {
+                        push(@foundList,$rec);
+                    } else {
+                        if (($op2 eq '=') || ($op2 eq '==')) {
+			    # Reminder: We are checking:
+			    # Set1: Requires: foo >= 2  [pkgCap1, op1, val1]
+			    # Set2: Provides: foo == 3  [pkgCap2, op2, val2]
+			    # Thus, True if val2 op1 val1 is true (3 >= 2 here).
+                            $cmpVal = cmp_rpmstrings($val2, $val1);
+			    if (checkOpTruth($op1,$cmpVal)) {
+				push(@foundList,$rec);
+			    } else {
+				doLog($TPSTXT,$TPSLOG,"OpFalse: $val2 $op1 $val1 ret $cmpVal on: $p\n");
+			    }
+                        } else {
+                            print STDERR "WEIRD 'PROVIDES' STRING: $p from $rec->{n} $rec->{v} $rec->{r} $rec->{a}\n";
+			    doLog($TPSTXT,$TPSLOG,"WEIRD 'PROVIDES' STRING: $p from $rec->{n} $rec->{v} $rec->{r} $rec->{a}\n");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return(@foundList);
+}
+sub unDup($) {
+    my ($r) = @_;
+    my @t = @$r;
+    my %h;
+    my $cnt = 0;
+    my @ret = ();
+
+    foreach my $k (@t) {
+        if (!exists($h{$k})) {
+            $h{$k} = $cnt;
+            $cnt++;
+        }
+    }
+
+    foreach my $k (sort { $h{$a} <=> $h{$b} } (keys(%h))) {
+        push @ret, $k;
+    }
+
+    return @ret;
+}
+
+sub addToChannelsForPackage($$) {
+    my ($pkg,$chan) = @_;
+    my @newList = ();
+    if (!exists($channelsForPkg{$pkg})) {
+        $channelsForPkg{$pkg} = \@newList;
+    }
+    push @{$channelsForPkg{$pkg}}, $chan if (!listInclude($channelsForPkg{$pkg},$chan));
+}
+# okay, so find_package has found something we could use
+# instead of what the ET told us.  But... should we use it?
+# Not unless it's the latest in the channel, so let's verify
+# that here.
+sub verifySubstitution($$$) {
+    my ($oldItem,$newItem,$listType) = @_;
+    my $rc = 0;
+    my $isR6plus = (($globs->{tpsProductRel} >= 6) && ($globs->{tpsProductFam} eq 'RHEL'));
+
+    # We only permit substitutions on old-files; any
+    # troubles with new-files will cause havoc on push,
+    # so fail those now.
+    return $rc unless ($listType eq 'old');
+
+    return $rc unless (exists($channelsForPkg{$oldItem}));
+    my $chListRef = $channelsForPkg{$oldItem};
+    my $newItemName = `rpm -q --qf '%{name}' $globs->{tpsNoSig} -p $newItem 2>/dev/null`;
+    return $rc unless ($? == 0);
+
+    # RHN does not carry info on -debuginfo packages before RHEL6.
+    # Return okay for those, since the main package should
+    # trigger an error if there is an actual problem.
+    chomp($newItemName);
+    return 1 if ((!$isR6plus) && ($newItemName =~ m/-debuginfo$/));
+
+    my $cmd = $RealBin . '/tps-check-channels -n -c "'. join(',',@$chListRef) .'" live "'.$newItemName.'"';
+    doLog($TPSCMD,$TPSDEBUG,"$cmd\n");
+    my $out = `$cmd`;
+    doLog($TPSCMDOUT,$TPSDEBUG,"$? : $out\n");
+    return $rc unless ($? == 0);
+    my $newBase = basename($newItemName);
+    $rc = 1 if ($out =~ m/\Q$newBase\E/m);
+
+    return $rc;
+}
+
+# markBadNameArch changes na_okay to 0 for packages
+# which have a duplicated Name.Arch and which are
+# not the (rpm-wise) newest version.  Feed it
+# things like $oldHash or $newHash.
+sub markBadNameArch($) {
+    my ($pkgHash) = @_;
+    my %seen;
+    my $tmp;
+
+    foreach my $k (sort(keys(%$pkgHash))) {
+        # ensure that name.arch is uniq/newest
+        next if exists($seen{$k});
+        $seen{$k} = 1;
+        $tmp = $pkgHash->{$k};
+        $tmp->{na_okay} = 1;
+        my $r;
+        my @pkgKeys = sort(keys(%$pkgHash));
+        my @dupList = grep { 
+            $r = $pkgHash->{$_};
+            ($tmp->{na} eq $r->{na}) &&
+                (1 == $r->{valid}) &&
+                (0 == $r->{dup_md5}) &&
+                ($tmp->{md5} ne $r->{md5});
+        } @pkgKeys;
+        next unless (scalar(@dupList) > 0);
+        push @dupList, $k;
+        # dupList is now a collection of keys which
+        # refer to pkgs with the same name.arch.  (Same as $k.)
+        # Sort the list by rpm epoch:version-release => oldest-to-newest.
+        my @rpmOrdered = sort { cmp_rpmstrings($pkgHash->{$a}->{evr}, $pkgHash->{$b}->{evr}) } @dupList;
+        my $newest = pop @rpmOrdered;
+        $pkgHash->{$newest}->{na_okay} = 1;
+        $seen{$newest} = 1;
+        do { $pkgHash->{$_}->{na_okay} = 0; $seen{$_} = 1 } for @rpmOrdered;
+    }
+}
+
+#####################
+#  checkArchChange  #  Warn if a package changes arch, e.g. bin->noarch
+#####################
+#
+# inputs:
+#  Supports structures from tps-make-lists (@mastList style).
+#  Use:
+#    $oldMastList, $newMastList
+# outputs: number of packages with changed arches (0 == PASS)
+#
+sub checkArchChange($$) {
+    my %arches;
+    my $changeDetected = 0;
+
+    # Pass 1: preserve the arch(es) for each old and new package
+    for my $which ('old', 'new') {
+        my $pkgRef = shift;  #  ${old,new}mastList [ARRAY]
+        # @oldMastList/@newMastList style, a la tps-make-lists
+        for my $pkg (@$pkgRef) {
+            push @{$arches{$which}{$pkg->{n}}}, $pkg->{a};
+        }
+    }
+
+    # Pass 2: Look for changes. For each package that exists in both old
+    # and new, if the arch list differs, report it.
+    for my $pkg (sort keys %{$arches{new}}) {
+        if (exists $arches{old}{$pkg}) {
+            my @s = map { join(',', sort @{$arches{$_}{$pkg}}) } ('old','new');
+            if ($s[0] ne $s[1]) {
+                # FIXME: better reporting, e.g. 'lost arch'/'gained arch'?
+                my $what = "changed arch from $s[0] to $s[1]";
+                doLog($TPSWARN,$TPSLOG, "WARNING: Package $pkg $what\n");
+                $changeDetected++;
+            }
+        }
+    }
+    return $changeDetected;
+}
+#############################################
+
+
+###########################
+#  find_rhn_dest_channel  #  Determine destination channel for advisory
+###########################
+#
+# This can refine the value of $globs->{rhnDestChannel}, which is
+# obtained from the Errata Tool via tps-channel-info when tps-lib
+# is initialized.  It should have only a single channel;
+# however, sometimes ET returns multiple channels.
+#
+# We want exactly *one* destination channel.  One of the reasons
+# for this is to ensure that we're running on the correct machine.
+# That's not typically a problem for automation, but it can be
+# for manual runs -- and the tester is typing the command into
+# the wrong shell.  We don't want to attempt running a RHEL-5
+# advisory on a RHEL-7 system, or whatever.
+#
+# Slight historical misnomer:  this applies to both RHN and
+# Pulp (CDN) channels, despite the function (and variable) name.
+#
+sub find_rhn_dest_channel {
+    my @subbedChannels = getSubscribedChannels();
+    my @destChannels   = split("\n", $globs->{rhnDestChannel});
+
+    # No channels. This can happen.  It's not a good sign.
+    if (! @destChannels) {
+        doLog($TPSWARN,$TPSLOG,"WARNING: no destination channel found\n");
+        return '';
+    }
+
+    # Just one channel. That's fine.
+    if (@destChannels == 1) {
+        return $destChannels[0];
+    }
+
+    # More than one.
+    doLog($TPSWARN,$TPSLOG,"WARNING: too many destination channels found\n");
+
+    # The list from ET may include channels that we are not subscribed to.
+    # Try to pick out the one with the shortest name and which we are
+    # subscribed to.  That is likely to be the Base Channel; child channels
+    # and such will almost always have longer names.
+    my @destChanByLength = sort { length($a) <=> length($b) || $a cmp $b } @destChannels;
+    foreach my $dc (@destChanByLength) {
+        if (grep { $_ eq $dc } @subbedChannels) {
+            doLog($TPSWARN,$TPSLOG,"INFO: Destination Channel set to '$dc'\n");
+            return $dc;
+        }
+    }
+
+    # If that didn't work, let's try just the shortest channel name.
+    # This may cause a failure later -- but if we're on the wrong system,
+    # failure now is good, because it prevents mayhem later.
+    my $candidate = $destChanByLength[0];
+
+    doLog($TPSWARN,$TPSLOG,"WARNING: Destination Channel set to '$candidate', which is not in our subscribed list\n");
+    return $candidate;
+}
+
+###############################################################################
+# BEGIN compartmentalized subtests
+
+#####################################
+#  _test_released_package_accuracy  #
+#####################################
+#
+# FIXME: describe what this test does and why
+#
+sub _test_released_package_accuracy {
+    my %oldHashH = @_;                          # in: FIXME: some hash
+
+    # ================================================================
+    ## Note: this "subTest" always PASSes, as we do not want to FAIL a run
+    ## because of packages in an unrelated channel.
+
+    my $irpa_examined = 0;
+
+    if (fixChannelCache('live')) {              # 1 = error, 0 = okay
+        doLog($TPSWARN,$TPSLOG,"WARNING:  No usable channel caches found, skipping accuracy analysis\n");
+        return 'PASS';
+    }
+
+  FOHLOOP:
+    foreach my $filepath (sort keys %oldHashH) {
+        my $relInfo = find_rhn_rel_info($oldHashH{$filepath});
+        if (defined($relInfo)) {
+            # it was released, but (a) where, and (b) is it the same as in oldHash?
+            my $possible = undef;
+            foreach my $phr (@$relInfo) {
+                if (cmp_rel_hr($phr,$oldHashH{$filepath})) {
+                    doLog($TPSTXT,$TPSLOG,(basename($filepath)." is released in $phr->{chan}\n"));
+                    next FOHLOOP;
+                }
+                $possible = $phr if ($phr->{a} eq ${oldHashH{$filepath}}->{a});
+            }
+            my $base_filepath = basename($filepath,'.rpm');
+            if (defined($possible)) {
+                doLog($TPSWARN,$TPSLOG,( $base_filepath .
+                                             " was not found as latest release\n"));
+                doLog($TPSINFO,$TPSLOG," => consider $possible->{fullname} from $possible->{chan} instead\n");
+            } else {
+                if ($base_filepath =~ m|\.src$|) {
+                    doLog($TPSTXT,$TPSLOG,( $base_filepath .
+                                                " was not found in released info, which is typical for SRPMs.\n"));
+                } else {
+                    doLog($TPSWARN,$TPSLOG,( $base_filepath .
+                                                 " was not found in released info, nor were any similar package names.\n"));
+                }
+            }
+        } else {
+            # wasn't really released, or our cache info is bad.
+            doLog($TPSWARN,$TPSLOG,("OldPackage not found on RHN:  ".basename($filepath)."\n"));
+        }
+        $irpa_examined++;
+    }
+
+    doLog($TPSTXT,$TPSLOG,"No released packages were found or examined.\n")
+        unless ($irpa_examined);
+
+    return 'PASS';
+}
+
+# END   compartmentalized subtests
+###############################################################################
+# BEGIN log helpers
+
+#######################
+#  write_master_list  #  Write @mastList hash elements to XML file
+#######################
+#
+# Input arguments:
+#   $outfile - full path to XML output file.
+#   @pkgs    - zero or more HREFs containing package NVRA and other info
+#
+sub write_master_list {
+    my ($outfile, @pkgs) = @_;
+    # number of <tpspkg>s written:
+    my $items_written = 0;
+    my $twig = XML::Parser::Expat->new();
+
+    # Create a temporary XML file. Write standard headers.
+    my $tmpfile = "$outfile.tmp.$$";
+    unlink $tmpfile;
+
+    open my $out_fh, ">$tmpfile"
+        or do {
+            doLog($TPSFAILTXT, $TPSRPT, "Could not create $tmpfile: $!\n");
+            return;
+        };
+
+    print $out_fh <<'END_XML_HEADER';
+<?xml version="1.0" encoding="UTF-8"?>
+<tpsMasterPackageList>
+ <tpsMasterListVersion>1.1</tpsMasterListVersion>
+END_XML_HEADER
+
+    # Each of these fields is written out in a slightly different style,
+    # and that includes the code that writes out all fields *not* listed below.
+    my @predone = qw(item erratum);
+    my @nvra    = qw(type n v r a);
+    my @rpmdeps = qw(conflicts obsoletes requires provides);
+    my @do_not_print = qw(na_okay);
+    my %to_skip = map { $_ => 1 } (@predone, @nvra, @rpmdeps, @do_not_print);
+    my ($deps, $deps_string);
+
+    # Main loop: one XML stanza for each package.
+    foreach my $pkg (@pkgs) {
+        # First line: package info
+        print $out_fh <<"END_PKG";
+ <tpspkg path="$pkg->{item}" erratum="$pkg->{erratum}">
+END_PKG
+
+        # Next: N-V-R and arch, all on one line.
+        print $out_fh " ";
+        print $out_fh " <$_>$pkg->{$_}</$_>"    for @nvra;
+        print $out_fh "\n";
+
+        # Next: fields not otherwise accounted for, one per line.
+        # Ensure that only non-blank keys are used (sometimes blank ones creep in)
+        foreach my $k (sort grep { $_ && !$to_skip{$_} } keys %$pkg) {
+            print $out_fh "  <$k>", $twig->xml_escape($pkg->{$k}), "</$k>\n";
+        }
+
+        # Next: rpm dependency fields, one per line. These are AREFs;
+        # we display them as a single comma-separated string.
+        foreach my $k (@rpmdeps) {
+            print $out_fh "  <$k>";
+            if (defined($deps = $pkg->{$k})) {
+                $deps_string = join(',', @$deps);
+                $deps_string =~ s/\s+$//;
+                print $out_fh $twig->xml_escape($deps_string);
+            }
+            print $out_fh "</$k>\n";
+        }
+        print $out_fh " </tpspkg>\n\n";
+
+        $items_written++;
+    }
+
+    # Done. Finish writing...
+    print $out_fh "</tpsMasterPackageList>\n";
+    close $out_fh
+        or do {
+            doLog($TPSFAILTXT, $TPSRPT, "Error writing $tmpfile: $!\n");
+            return;
+        };
+
+    # ...rename info place...
+    rename $tmpfile => $outfile
+        or do {
+            doLog($TPSFAILTXT,$TPSRPT,"Error mv'ing $tmpfile into place: $!\n");
+            return;
+        };
+
+    # ...and inform the user.
+    doLog($TPSTXT,$TPSLOG,"Wrote $items_written items to $outfile\n");
+
+    return 1;
+}
+
+# END   log helpers
+###############################################################################
+# BEGIN main code
+
+# The term is "modulino".
+__PACKAGE__->main() unless caller();
+
+sub main {
+    my_init();
+
+    ### Variables for overall & individual tests
+    my $tName;
+    my $tResult = 'FAIL';
+    my $overallResult = 'FAIL';
+    my $warnCount = 0;
+    my $failCount = 0;
+    my ($tWarnCount, $tFailCount);
+    $globs->{tml_detectedOldObsFile} = 0; # possibly reset by findObsoletes().
+    $globs->{tml_GRPfails} = 0; # whether GetReleasedPackages failed.
+    $globs->{tml_GRPlies} = 0;  # whether CheckNewlyReleased detects a GRP lie.
+
+    shellExportsToEnv('/etc/tpsd.conf',0);
+    ########## fixme
+    # If running under automation, get our TPS_MODE and such
+    ## [ -f /etc/tpsd.conf ] && . /etc/tpsd.conf
+    ## export TPS_MODE=${TPS_MODE:-normal}
+
+    $globs->{tpsErratum} = $erratum unless (($globs->{tpsErratum}) && ($globs->{tpsErratum} ne 'unknown'));
+    $PrimaryErratum = $globs->{tpsErratum};
+
+    # ================================================================
+    $tName = "Determine RHN Destination Channel";
+    # ================================================================
+    #    * check the files against the rhn channel caches
+    $tWarnCount = 0; $tFailCount = 0; $tResult = 'FAIL';
+    beginTest($tName);
+
+    getRHNDestChannel();
+    doLog($TPSINFO,$TPSRPT,"INFO: Destination Channel(s): $globs->{rhnDestChannel}\n");
+
+    # Find a single destination channel.  Possibly an empty string.
+    my $rhn_dest_channel = find_rhn_dest_channel();
+
+    # This overrides previous setting of rhnDestChannel,
+    # which may have had multiple newline-separated values.
+    # This is intentional, as there should be exactly one value.
+    $globs->{rhnDestChannel} = $rhn_dest_channel;
+
+    if ($rhn_dest_channel) {
+        $tResult = 'PASS';
+        push @channelArgList, $rhn_dest_channel;
+    }
+
+    push @channelArgList, getSubscribedChannels();
+    @channelArgList = unDup(\@channelArgList);
+
+    doLog($TPSINFO,$TPSRPT,"Working with erratum ${erratum}; release ${release}; ".
+          "and arch ${arch}\n" .
+          "And ET Release: $globs->{tpsETRelease}\n");
+    doLog($TPSINFO,$TPSLOG,"Channels:  ". join(" ",@channelArgList)."\n");
+    $ENV{ERRATA} = $erratum unless ($ENV{ERRATA});
+    $ENV{RELEASE} = $release unless ($ENV{RELEASE});
+    $ENV{ARCH} = $arch unless ($ENV{ARCH});
+    $ENV{TRUE_ARCH} = $globs->{trueArch} unless ($ENV{TRUE_ARCH});
+    $fNames = defFileNames($release,$arch);
+    if ($debug) {
+        foreach my $f (sort(keys(%$fNames))) {
+            #print "$f : $fNames->{$f}\n";
+            print "${f}=\"$ENV{$f}\"\n";
+        }
+    }
+    $overallResult = endTest($tResult,$tName);
+    $failCount++ if ($overallResult ne 'PASS');
+
+    # ================================================================
+    $tName = "Fetch New Package List";
+    # ================================================================
+    #    * check the files against the rhn channel caches
+    $tWarnCount = 0; $tFailCount = 0; $tResult = 'FAIL';
+    beginTest($tName);
+    my $foundFailures = 0;
+    my @errataList = ();
+    my $isPrimary = 1;
+    push @errataList,$erratum;
+    getDepErrata(\@errataList,$errataArg,$primaryOnly,\@excludeDepList,$optXDependingFor,$optXBlockingFor);
+    my @newPkgList = ();
+    my @newPkgHashList = ();
+    doLog($TPSTIP,$TPSRPT,"ErrataList: " . join(', ',@errataList) . "\n");
+    doLog($TPSTIP,$TPSLOG,"Hint: Check the full chain of DependsOn/Blocks fields in the ".
+          "Errata Tool if the ErrataList seems confusing.\n");
+
+    if ($skipNew) {
+        my $existingNewR = fileToListRef("$outDir/$ENV{FILES_OUT}");
+        my $existingSrcR = fileToListRef("$outDir/$ENV{SRC_OUT}");
+        map { push @newPkgList,$_ } @$existingNewR;
+        map { push @newPkgList,$_ } @$existingSrcR;
+        if (scalar(@newPkgList) >= 1) {
+            my $newHash = hashifyRpmList('new',\@newPkgList,$isPrimary);
+            push @newPkgHashList, $newHash;
+        }
+    } else {
+        my @tmpNPList;
+        foreach my $erat (@errataList) {
+            my $href = getPkgHashKeyedByChannels(0,$erat,$optDebugGCP);
+            my (@a,$newHash);
+            # my @good_a = ();
+            my $cnt = 0;
+
+            @tmpNPList = ();
+
+            # doLog($TPSMISC,$TPSDEBUG, ("$erat -- subscribed channels: " . join(',', @channelArgList) . "\n"));
+            # Each key is a channel name; value is an array ref of /qual/i/fied/filenames
+            foreach my $k (sort(keys(%$href))) {
+                @a = @{$href->{$k}};
+                # print STDERR "$k : ", join(" ",@a), "\n";
+                # doLog($TPSMISC,$TPSDEBUG, ("$erat newpkg Channel: $k vs (" . join(',', @channelArgList) . ")\n"));
+                foreach my $ch (@channelArgList) {
+                    if (($ch eq $k) || (getChannelIDName($ch,$globs) eq $k)) {
+                        doLog($TPSTXT,$TPSLOG,"Found " .(scalar(@a)). " packages for $erat in channel: $k\n");
+                        foreach my $pkge (@a) {
+                            push @tmpNPList, $pkge;
+                            addToChannelsForPackage($pkge,$ch);
+                        }
+                    }
+                }
+                $cnt++;
+            }
+            doLog($TPSTXT,$TPSLOG,"Channels that $erat will ship to: $cnt\n");
+            if (scalar(@tmpNPList) >= 1) {
+                $newHash = hashifyRpmList('new',\@tmpNPList,$erat);
+                push @newPkgHashList, $newHash;
+                push @newPkgList,@tmpNPList;
+            }
+            $isPrimary = 0;
+        }
+    }
+    my (%newHashH, $newHash);
+    foreach my $h (@newPkgHashList) {
+        foreach my $k (keys(%$h)) {
+            if (exists($newHashH{$k})) {
+                my $d = $h->{$k};
+                my $o = $newHashH{$k};
+                doLog($TPSWARN,$TPSRPT,("DUPLICATE DISCARDED: ". basename($d->{item}) . " from $d->{erratum}.  Kept copy from: $o->{erratum}.\n"));
+            } else {
+                $newHashH{$k} = $h->{$k};
+            }
+        }
+    }
+    doLog($TPSTXT,$TPSRPT,("Count of new packages: " . (scalar(@newPkgList)) . " (may include duplicates found in multiple channels)\n"));
+    ### Gather PROVIDES_OUT info from new files list.
+    my @provides;
+    if (scalar(@newPkgList) >= 1) {
+        # FIXME: is "is21" still relevant?
+        my @nosig = ((1 == $globs->{is21}) ? () : ('--nosignature'));
+        my $provides = doRpmCommand('rpm', '-q', @nosig, '--provides',
+                                    '-p', @newPkgList);
+        # This gives us a list of newline-terminated strings. Convert that
+        # to list form, with duplicates removed.
+        my %p_seen;
+        for my $p (split "\n", $provides) {
+            chomp $p;
+            push @provides, $p  unless $p_seen{$p}++;
+        }
+    }
+
+    # Write sorted list to file, safely.
+    eval {
+        my $provides_file = "$outDir/$fNames->{PROVIDES_OUT}";
+        my $provides_tmp  = "$provides_file.tmp.$$";
+        unlink $provides_tmp;
+        open my $provides_fh, '>', $provides_tmp
+            or die "Cannot create $provides_tmp: $!\n";
+        print { $provides_fh } $_,"\n"         for sort @provides;
+        close $provides_fh
+            or die "Error writing $provides_tmp: $!\n";
+        rename $provides_tmp => $provides_file
+            or die "Could not rename $provides_tmp into place: $!\n";
+    };
+    if ($@) {
+        # Could not create, write to, or rename PROVIDES_OUT.
+        # Presumably some problem with the working directory, best
+        # to fail (and not proceed with tps-{,s}rpmtest).
+        doLog($TPSFAILTXT,$TPSLOG,$@);
+        $foundFailures++;
+    }
+    if ($newFileNotFound) {
+        # The list of new files had one or more unavailable rpms for which 
+        # no alternatives could be found.  Report this unhappy finding; perhaps
+        # the user will manually tweak to recover, or re-run later.
+        # We want to report on this condition in addition to any previous failures.
+        doLog($TPSFAILTXT,$TPSLOG,"There was a problem with the new package info\n");
+        doLog($TPSTIP,$TPSLOG, "Check the failure messages to determine whether the file is present on /mnt/redhat\n");
+        doLog($TPSFAILTXT,$TPSLOG,"No new packages were found\n") if (scalar(keys(%newHashH)) < 1);
+        $foundFailures++;
+    } 
+    if (scalar(keys(%newHashH)) < 1) {
+        # The new-files list is entirely empty.  Nothing to test, very bad.
+        doLog($TPSFAILTXT,$TPSLOG,"No new packages were found\n");
+        $foundFailures++;
+    }
+
+    $tResult = 'PASS' unless ($foundFailures);
+    $newHash = \%newHashH;
+
+    $overallResult = endTest($tResult,$tName);
+    $failCount++ if ($overallResult ne 'PASS');
+
+    # ================================================================
+    $tName = "Get Released Packages";
+    # ================================================================
+    #    * check the files against the rhn channel caches
+    $tWarnCount = 0; $tFailCount = 0; $tResult = 'FAIL';
+    beginTest($tName);
+    $isPrimary = 1;
+    my @oldHashList = ();
+    if ($skipOld) {
+        my @oldPkgList = ();
+        my $existingOldR = fileToListRef("$outDir/$ENV{OLDFILES_OUT}");
+        my $existingSrcR = fileToListRef("$outDir/$ENV{OLDSRC_OUT}");
+        map { push @oldPkgList,$_ } @$existingOldR;
+        map { push @oldPkgList,$_ } @$existingSrcR;
+        if (scalar(@oldPkgList) >= 1) {
+            my $oldHash = hashifyRpmList('old',\@oldPkgList,$isPrimary);
+            push @oldHashList, $oldHash;
+        }
+    } else {
+        foreach my $erat (@errataList) {
+            my @oldPkgList = ();
+            my $href = getPkgHashKeyedByChannels(1,$erat,$optDebugGRCP);
+            my (@a,$oldHash);
+            my $cnt = 0;
+
+            foreach my $k (sort(keys(%$href))) {
+                @a = @{$href->{$k}};
+                # print STDERR "$k : ", join(" ",@a), "\n";
+                # doLog($TPSMISC,$TPSDEBUG, ("$erat oldpkg Channel: $k vs (" . join(',', @channelArgList) . ")\n"));
+                foreach my $ch (@channelArgList) {
+                    if (($ch eq $k) || (getChannelIDName($ch,$globs) eq $k)) {
+                        doLog($TPSTXT,$TPSLOG,"Found " . scalar(@a) . " released packages for $erat in channel: $k\n");
+                        foreach my $pkge (@a) {
+                            # $pkge value type: /mnt/redhat/brewroot/path/to/package-1.0-1.arch.rpm
+                            push @oldPkgList, $pkge;
+                            addToChannelsForPackage($pkge,$ch);
+                        }
+                    }
+                }
+                $cnt++;
+            }
+            doLog($TPSTXT,$TPSLOG,"Channels that $erat has shipped to: $cnt\n");
+            if (scalar(@oldPkgList) >= 1) {
+                $oldHash = hashifyRpmList('old',\@oldPkgList,$erat);
+                push @oldHashList, $oldHash;
+            }
+
+            doLog($TPSTXT,$TPSLOG, "\nReleased Packages for $erat (may include duplicates):\n");
+            foreach my $n (@oldPkgList) {
+                doLog($TPSTXT,$TPSLOG, "  $n\n");
+            }
+
+            # Both of these are hash refs.  Key is full file path.
+            # Value is another hashref, which is full info for a single rpm.
+            # keys of interest should be: dup_md5, valid, type, and rpm query members:
+            # { n v r a md5 epoch srpm is_src sha1 rsa gpg pgp insttime rpmversion };
+            # my $oldHash = hashifyRpmList('old',\@oldPkgList,$isPrimary);
+            # push @oldHashList,$oldHash;
+            $isPrimary = 0;
+        }
+    }
+    my (%oldHashH, $oldHash);
+    foreach my $h (@oldHashList) {
+        foreach my $k (keys(%$h)) {
+            if (exists($oldHashH{$k})) {
+                my $d = $h->{$k};
+                my $o = $oldHashH{$k};
+                doLog($TPSWARN,$TPSRPT,("DUPLICATE DISCARDED: ". basename($d->{item}) . " from $d->{erratum}.  Kept copy from: $o->{erratum}.\n"));
+            } else {
+                $oldHashH{$k} = $h->{$k};
+            }
+        }
+    }
+    if ($oldFileNotFound) {
+        doLog($TPSFAILTXT,$TPSLOG,"There was a problem with the released package info\n");
+        doLog($TPSTIP,$TPSLOG, "Check the failure messages to determine whether the released name-version-revision information is actually current, or whether the file is present on /mnt/redhat\n");
+        $globs->{tml_GRPfails} = 1;
+    } elsif (scalar(keys(%oldHashH)) < 1) {
+        doLog($TPSFAILTXT,$TPSLOG,"No old packages were found\n");
+        doLog($TPSTIP,$TPSLOG,"This failure may be overridden by the CheckNewlyReleased test if the packages are determined to be a new release.\n");
+        $globs->{tml_GRPfails} = 1;
+    } else {
+        $tResult = 'PASS';
+    }
+    $oldHash = \%oldHashH;
+    $overallResult = endTest($tResult,$tName);
+    $failCount++ if ($overallResult ne 'PASS');
+
+    #######################
+    #  find_rhn_rel_info  #  Given a package name, finds channel info
+    #######################
+    #
+    # Input is a hashref with key 'n' that's a package name (just the name).
+    # Returns AREF containing one or more HREFs, each of which includes N-V-R,
+    # arch, and channel.
+    # If none are found, returns undef.
+    #
+    sub find_rhn_rel_info($) {
+        my ($startHR) = @_;
+        my @resList;
+        # keys: item=filepath, n v r a epoch, type=new|old, srpm, is_src, isPrimary
+        my $res = `tps-check-channels -s ' ' -n live $startHR->{n}`;
+        foreach my $ln (split(/\n/,$res)) {
+            chomp($ln);
+
+            # eg:
+            # rhel-x86_64-server-sjis-6.2.z: coreutils 8.4 16.el6.sjis.1 x86_64
+            my ($chan,$n,$v,$r,$a) = split(/\s+/,$ln);
+            next unless ($chan =~ s/://);
+            my %resHash;
+            $resHash{a} = $a;
+            $resHash{n} = $n;
+            $resHash{v} = $v;
+            $resHash{r} = $r;
+            $resHash{fullname} = "${n}-${v}-${r}.${a}";
+            $resHash{chan} = $chan;
+            push @resList,\%resHash;
+        }
+        return(\@resList) if (scalar(@resList) > 0);
+        return undef;
+    }
+    sub cmp_rel_hr($$) {
+        my ($hra,$hrb) = @_;
+        if ($hra->{fullname} eq "$hrb->{n}-$hrb->{v}-$hrb->{r}.$hrb->{a}") {
+            return $hra->{chan};
+        }
+        return '';
+    }
+
+    # ================================================================
+    run_subtest(
+        sub { _test_released_package_accuracy(%oldHashH) },
+        'Info on Released Package Accuracy',
+        <<'END_TIP');
+This section provides information on the accuracy of the released package
+information compared to the versions available via current subscriptions
+END_TIP
+
+    # ================================================================
+    $tName = "Process and List Packages";
+    # ================================================================
+    $tWarnCount = 0; $tFailCount = 0; $tResult = 'PASS';
+    beginTest($tName);
+
+    my @mastList = ();
+    my @rejList = ();
+    my $tmp;
+    # Useful to keep valid&uniq old/new lists:
+    my @newMastList = ();
+    my @oldMastList = ();
+    my @badNewList = ();
+    my @newPrimMastList = ();
+    my $tmpMastRef = \@oldMastList;
+    my $newMastCnt = 0;
+    my $oldMastCnt = 0;
+
+    markBadNameArch($oldHash);
+    markBadNameArch($newHash);
+    foreach my $ar ($oldHash,$newHash) {
+        foreach my $k (sort(keys(%$ar))) {
+            $tmp = $ar->{$k};  # hash of single-package data
+            if ((1 == $tmp->{valid}) && (0 == $tmp->{dup_md5}) && (1 == $tmp->{na_okay})) {
+                push(@mastList,$tmp);
+                push(@$tmpMastRef, $tmp);
+                if ($tmp->{type} eq 'new') {
+                    $newMastCnt++;
+                    if (1 == $tmp->{isPrimary}) {
+                        push(@newPrimMastList,$tmp);
+                    }
+                }
+                $oldMastCnt++ if ($tmp->{type} eq 'old');
+            } else {
+                push(@rejList,$tmp);
+            }
+        }
+        $tmpMastRef = \@newMastList;
+    }
+    doLog($TPSTXT,$TPSLOG,"\nMASTER LIST:\n");
+    foreach my $hr (@mastList) {
+        doLog($TPSTXT,$TPSLOG," $hr->{type}: $hr->{n} $hr->{v} $hr->{r} $hr->{a}\n");
+    }
+    doLog($TPSTXT,$TPSLOG,"\nREJECT LIST:\n\n");
+    foreach my $hr (@rejList) {
+        doLog($TPSTXT,$TPSLOG," $hr->{type}: $hr->{n} $hr->{v} $hr->{r} $hr->{a}\n");
+        push @badNewList, $hr if ($hr->{type} eq 'new');
+    }
+    doLog($TPSTXT,$TPSLOG,"\nCount of unique new packages: $newMastCnt\n");
+    doLog($TPSTXT,$TPSLOG,"Count of unique old packages: $oldMastCnt\n");
+
+    if (scalar(@badNewList) > 0) {
+        $tResult = 'FAIL';
+        doLog($TPSFAILTXT,$TPSRPT, "\nERROR: Multiple new-files with the same Name.Arch were found.\n");
+        my @badNewNames = map { "  $_->{n}-$_->{v}-$_->{r}.$_->{a}.rpm" } @badNewList;
+        doLog($TPSFAILTXT,$TPSLOG, ("The following packages probably should not be shipped:\n" . join("\n",@badNewNames) . "\n\n"));
+        doLog($TPSTIP,$TPSLOG, "Check the Master and Reject Lists above, then check the Errata Tool.\n");
+        doLog($TPSTIP,$TPSLOG, "There should only be one Version-Release for a given Name.Arch.\n\n");
+    }
+
+    #    * check to see that no new files are also on the old list
+    # KEYS: n v r a md5 epoch srpm is_src sha1 rsa gpg pgp insttime rpmversion
+    my @hasNoOldPkg = ();
+    my @peers = ();
+    my $foundPeers;
+    foreach my $nhr (@newMastList) {
+        my @curPeers = ( $nhr );
+        $foundPeers = 0;
+        # nhr, new hash ref; ohr, old hash ref.
+        OHR: foreach my $ohr (@oldMastList) {
+            next OHR if (1 == $ohr->{dup_md5});
+            # valid, 0==dup, type==opposite, matchall @keyMatch == Bad.
+            # with MastList, valid && 0==dup are pre-screened.
+            # Consider two packages as new/old peers if they have the
+            # same name.arch (good peers), or the same md5sum (bad peers).
+            if ( (($nhr->{n} eq $ohr->{n}) && ($nhr->{a} eq $ohr->{a})) ||
+                 ($nhr->{md5} eq $ohr->{md5}) ) {
+                push @curPeers, $ohr;
+                $foundPeers++;
+            }
+        }
+        if (0 == $foundPeers) {
+            push @hasNoOldPkg, $nhr;
+        } else {
+            push @peers, \@curPeers;
+        }
+    }
+    $overallResult = endTest($tResult,$tName);
+    $failCount++ if ($overallResult ne 'PASS');
+
+    # ================================================================
+    $tName = "Package Uniqueness Test";
+    # ================================================================
+    $tWarnCount = 0; $tFailCount = 0; $tResult = 'FAIL';
+    beginTest($tName);
+    foreach my $peerSet (@peers) {
+        my $newpr = shift(@$peerSet); # new pkg is first in peerSet.
+        my $pkg = "$newpr->{epoch}:$newpr->{n}-$newpr->{v}-$newpr->{r}.$newpr->{a}.rpm";
+
+        # debugging
+        my ($oldpkg,$dbstr);
+        $dbstr = "New: $pkg Old: ";
+        foreach my $oldpr (@$peerSet) {
+            $oldpkg = "$oldpr->{epoch}:$oldpr->{n}-$oldpr->{v}-$oldpr->{r}.$oldpr->{a}.rpm";
+            $dbstr .= "$oldpkg ";
+        }
+        doLog($TPSMISC,$TPSDEBUG,"$dbstr\n");
+        # end debugging
+        if (1 < scalar(@$peerSet)) {
+            # more than one peer is a very weird failure...
+            $tFailCount++;
+            doLog($TPSFAILTXT,$TPSLOG,"New package has more than one matching old package: $pkg\n");
+            doLog($TPSFAILTXT,$TPSLOG,"  NewPath: $newpr->{item}\n");
+            foreach my $oldpr (@$peerSet) {
+                doLog($TPSFAILTXT,$TPSLOG,"  OldPath: $oldpr->{item}\n");
+            }
+        }
+        foreach my $oldpr (@$peerSet) {
+            if ($newpr->{md5} eq $oldpr->{md5}) {
+                # fail, same package on old & new lists
+                $tFailCount++;
+                doLog($TPSFAILTXT,$TPSLOG,"Package with same md5sum appears on both old and new filelists: $pkg\n");
+                doLog($TPSFAILTXT,$TPSLOG,"  NewPath: $newpr->{item}\n");
+                doLog($TPSFAILTXT,$TPSLOG,"  OldPath: $oldpr->{item}\n");
+            } elsif ( ($newpr->{n} eq $oldpr->{n}) &&
+                      ($newpr->{v} eq $oldpr->{v}) &&
+                      ($newpr->{r} eq $oldpr->{r}) &&
+                      ($newpr->{a} eq $oldpr->{a}) &&
+                      ($newpr->{epoch} eq $oldpr->{epoch}) ) {
+                # fail, same package on old & new lists
+                $tFailCount++;
+                doLog($TPSFAILTXT,$TPSLOG,"Package with same epoch:NVRA appears on both old and new filelists: $pkg\n");
+                doLog($TPSFAILTXT,$TPSLOG,"  NewPath: $newpr->{item}\n");
+                doLog($TPSFAILTXT,$TPSLOG,"  OldPath: $oldpr->{item}\n");
+                doLog($TPSFAILTXT,$TPSLOG,"  New: Signed with: $newpr->{sign_key} SigType: $newpr->{sign_key_type}\n");
+                doLog($TPSFAILTXT,$TPSLOG,"  Old: Signed with: $oldpr->{sign_key} SigType: $oldpr->{sign_key_type}\n");
+            }
+        }
+    }
+    if (0 == $tFailCount) {
+        doLog($TPSTXT,$TPSRPT,"No new packages were found on the old package list.\n");
+    }
+    $tResult = 'PASS' if (0 == $tFailCount);
+    $overallResult = endTest($tResult,$tName);
+    $failCount++ if ($overallResult ne 'PASS');
+    # ================================================================
+
+    # The usual files (new-src, pkgnames, etc) can now be dealt with by using is_src etc.
+    # remember, still need:
+    #    * check to see that no new files are also on the old list
+    #    * check the files against the rhn channel caches
+    #    * deps for the obsfiles and source; source should probably be done in srpmtest.
+
+    # ================================================================
+    $tName = "Check Newly Released Packages";
+    # ================================================================
+    #    * check the files against the rhn channel caches
+    $tWarnCount = 0; $tFailCount = 0; $tResult = 'FAIL';
+    beginTest($tName);
+    if (0 == scalar(@hasNoOldPkg)) {
+        doLog($TPSTXT,$TPSLOG,"All new packages had matching old packages.\n");
+        $ENV{TPS_NEWPKGRELEASE} = 'false';
+    } else {
+        my $notOK = 1;
+        my $retries = 0;
+        my $hasNoOldPkgStr = join(" ",(map { $_->{n} } @hasNoOldPkg));
+        my $hasNoOldPkgStrNA = join(" ",(map { $_->{n} . '.' . $_->{a} } @hasNoOldPkg));
+        while ($notOK != 0) {
+            $notOK = 0 if ($notOK > 1);  # retry only once.
+            my $outCmd = "tps-check-channels -f NA -n -d live $hasNoOldPkgStrNA";
+            my $newlyReleasedInfo = `$outCmd 2>&1`;
+            if (0 == $?) {
+                # Oops, we Found Stuff, these aren't really new releases.
+                $notOK = 0;
+                $tFailCount = 1;
+                my $ET_RT = 'errata-admin';
+                doLog($TPSFAILTXT,$TPSLOG,("Released packages were found among: ".
+                                           "$hasNoOldPkgStr --\n"));
+                doLog($TPSFAILTXT,$TPSLOG,"$newlyReleasedInfo\n");
+                doLog($TPSINFO,$TPSLOG,qq{ACTION: file a ticket with ${ET_RT}\@redhat.com to ensure
+    that released package info is correct.  Only one ticket is needed per erratum;
+    please list all the different Sources reported across runs.  Please cut and
+    paste the text from the SAMPLE REPORT section that appears below.
+    When the package info has been corrected, you will need to re-run TPS.\n});
+                doLog($TPSINFO,$TPSLOG,qq{INFO:  TPS requires a valid old-files list so that correct upgrade and
+    downgrade tests can be performed.  When a package is on the new-files
+    list but not the old, it is treated as a new release.  If this package
+    is on RHN, it is not a new release: this means the old-files info is
+    incomplete/incorrect, and proceeding with upgrades/downgrades would
+    generate invalid results.  In the worst case, it could damage the
+    system configuration and require a reinstall.  It is quick and simple
+    for ${ET_RT} to update missing ReleasedPackage info, if you file
+    complete information.  However, it is also possible that some files on
+    RHN are not supposed to be there.  This is why you should check to
+    ensure that all is well with this advisory, and report the issue to
+    the ${ET_RT} RT queue.\n});
+
+                doLog($TPSTIP,$TPSLOG,qq{TIP: If the old files were present before running tps-make-lists, it may
+    be possible to CAUTIOUSLY proceed with testing while you wait for
+    ${ET_RT} to help with the issue.  This requires running manually
+    -- and if running tps, use the -m option.  Check on IRC if you need
+    help.\n});
+    # }}
+                my $related_errata = join(" ",@errataList);
+
+                # Examine tps-check-channels output to find corresponding SRPMs.
+                my @nr_arr = ();
+                foreach my $nr_ln (split(/\n/,$newlyReleasedInfo)) {
+                    if ($nr_ln =~ m/(.*):\s+(.*)$/) {
+                        push(@nr_arr, $2);
+                    }
+                }
+                my $foundSRPMS = "Unknown\n";
+                my $errorPkgs = '';
+                my $nr_str;
+                if (scalar(@nr_arr) >= 1) {
+                    $nr_str = '';
+                    my $out = '';
+                    my $sep = ' ';
+                    foreach my $i (@nr_arr) {
+                        $out = `find_package $i 2>&1`;
+                        chomp($out);
+                        if (-r $out) {
+                            $nr_str .= ($out . $sep);
+                        } else {
+                            $errorPkgs .= ($out . $sep);
+                        }
+                    }
+                    my $nl = '\n';
+                    $foundSRPMS = `rpm -q --qf '%{sourcerpm}$nl' -p  $nr_str  2>&1 | sort | uniq`;
+                }
+                chomp($newlyReleasedInfo);
+
+                my $shownErrors = '';
+                $shownErrors = "Cannot Read: $errorPkgs\n" if ($errorPkgs);
+                doLog($TPSTXT,$TPSLOG,qq{::: SAMPLE REPORT :::
+      To:      ${ET_RT}\@redhat.com
+      Subject: $globs->{tpsErratum} - Missing Released Package Info
+      Erratum: $globs->{tpsErratum} - https://errata.devel.redhat.com/errata/show/$globs->{tpsErratum}
+      Related: $related_errata
+      Base RHN Channel: $globs->{rhnDestChannel}
+      Packages: $newlyReleasedInfo
+      SOURCES:  $foundSRPMS
+      $shownErrors
+    });
+                $ENV{TPS_NEWPKGRELEASE} = 'error';
+                $globs->{tml_GRPlies} = 1;
+                $globs->{tml_newlyReleased} = $newlyReleasedInfo;
+            } else {
+                # Did we fail due to missing channel cache?
+                my $dirsSearched = $ENV{TPS_CHAN_CACHE_DIR} || '/var/cache/tps/channels';
+                $dirsSearched .= '/live';
+                my @filesSearched = glob("$dirsSearched/*");
+                if (scalar(@filesSearched) < 1) {
+                    doLog($TPSWARN,$TPSLOG,"WARNING: TPS Channel Caches appear to be ".
+                          "missing; attempting to fix that now.\n");
+                    my $setupOut = `tps-setup-channel-cache -r live 2>&1`;
+                    if (0 != $?) {
+                        doLog($TPSWARN,$TPSLOG,"WARNING: tps-setup-channel-cache ".
+                              "failed: $setupOut\n");
+                        doLog($TPSWARN,$TPSLOG,"WARNING: You should manually ".
+                              "verify that these are newly released packages.\n");
+                        $notOK = 0;
+                    } else {
+                        if ($retries > 0) {
+                            doLog($TPSWARN,$TPSLOG,"WARNING: TPS Channel Caches could not be ".
+                                  "regenerated; you will need to check any 'new package' issues manually.\n");
+                        } else {
+                            $notOK++;
+                        }
+                        $retries++;
+                    }
+                } else {
+                    $notOK = 0;
+                    my ($cnt1,$cnt2);
+                    $cnt1 = scalar(@filesSearched);
+                    $cnt2 = scalar(@hasNoOldPkg);
+                    doLog($TPSTXT,$TPSLOG,"$cnt1 cached channels from rhn.live were ".
+                          "searched for existing releases for $cnt2 new RPMs\n");
+                    doLog($TPSTXT,$TPSLOG,"These really do appear to be newly released packages:\n$hasNoOldPkgStrNA\n");
+                    $ENV{TPS_NEWPKGRELEASE} = 'true';
+                    # Give the GRP failure a PASS since we checked and the pkgs are really new.
+                    if (1 == $globs->{tml_GRPfails}) {
+                        $failCount--;
+                        doLog($TPSINFO,$TPSRPT,"Overriding failure in Released Packages since these are new files.\n");
+                        $globs->{tml_GRPfails} = 0;  # Reset so no additional failCount--'s happen :)
+                    }
+                }
+            }
+        }
+    }
+    $tResult = 'PASS' if (0 == $tFailCount);
+    $foundReleasedPackages = $tFailCount;
+    $overallResult = endTest($tResult,$tName);
+    $failCount++ if ($overallResult ne 'PASS');
+
+    # ================================================================
+    #    * deps for the obsfiles and source; source should probably be done in srpmtest.
+    # ================================================================
+    $tName = "Gather Obsoletes Info";
+    # ================================================================
+    $tWarnCount = 0; $tFailCount = 0; $tResult = 'FAIL';
+    my $findObsHR; # for OBSPKGNAMES_OUT
+    beginTest($tName);
+    $findObsHR = findObsoletes(\@newMastList,\@oldMastList,\@mastList);
+    if ((1 == $globs->{tml_GRPfails}) && (1 == $globs->{tml_GRPlies}) && (1 == $globs->{tml_detectedOldObsFile})) {
+        $failCount -= 2;
+        doLog($TPSINFO,$TPSRPT,"Overriding failure in Released Packages since Obsoleted files can be used.\n");
+        doLog($TPSINFO,$TPSRPT,"Overriding failure in Newly Released Packages; using Obsoleted files.\n");
+        doLog($TPSWARN,$TPSRPT,"WARNING:  Check to be sure the file lists and RHN destinations are sane.\n");
+        doLog($TPSWARN,$TPSRPT,"WARNING:  Be sure that the Obsoleted file has been released,\n".
+              "and is not a leftover from errata testing.\n");
+        $globs->{tml_GRPfails} = 0;  # Reset so no additional failCount--'s happen :)
+    }
+    $tResult = 'PASS' if (0 == $tFailCount);
+    $overallResult = endTest($tResult,$tName);
+    $failCount++ if ($overallResult ne 'PASS');
+
+    # ================================================================
+    $tName = "Write Output Files";
+    # ================================================================
+    $tWarnCount = 0; $tFailCount = 0; $tResult = 'FAIL';
+    beginTest($tName);
+
+    my @outNames = qw{ ERRATA RELEASE ARCH TRUE_ARCH FILES_OUT OLDFILES_OUT SRC_OUT OLDSRC_OUT
+        PKGNAMES_OUT OLDPKGNAMES_OUT OBSFILES_OUT OBSPKGNAMES_OUT
+        RHTS_JOBID RHTS_RECIPEID TPSQ_RESPINS TPS_NEWPKGRELEASE
+        DEP_SRC_OUT DEP_FILES_OUT DEP_OLDSRC_OUT DEP_OLDFILES_OUT
+        DEP_PKGNAMES_OUT DEP_OLDPKGNAMES_OUT DEP_ERRATA
+        BUILD_REQ_MISSING SRPM_REQ_UPGRADE PROVIDES_OUT };
+    my ($outFile,$outFileFull,$written);
+
+    $ENV{DEP_ERRATA} = join(',',@errataList[1 .. (scalar(@errataList) - 1)]);
+
+    foreach my $n (qw{ RUNID RUNIDRHN JOBID JOBIDRHN }) {
+        if (exists($ENV{$n}) && $ENV{$n}) {
+            push @outNames, $n;
+        }
+    }
+
+    $outFile = "variable-names.sh"; $outFileFull = "$outDir/$outFile"; $written = 0;
+    if (open(VNAMES,">$outFileFull")) {
+        foreach my $n (@outNames) {
+            print VNAMES "${n}=\"$ENV{$n}\"\n";
+            $written++;
+        }
+        close(VNAMES);
+        doLog($TPSTXT,$TPSLOG,"Wrote $written items to $outFile\n");
+    } else {
+        doLog($TPSFAILTXT,$TPSRPT,"Cannot save $outFile to $outDir: $!\n");
+        $tFailCount++;
+    }
+
+    $tFailCount += createOutFile('SRC_OUT',         \@newMastList,\&eqRule,'item',0,1);
+    $tFailCount += createOutFile('DEP_SRC_OUT',     \@newMastList,\&eqRule,'item',0,0);
+    $tFailCount += createOutFile('OLDSRC_OUT',      \@oldMastList,\&eqRule,'item',0,1);
+    $tFailCount += createOutFile('DEP_OLDSRC_OUT',  \@oldMastList,\&eqRule,'item',0,0);
+    $tFailCount += createOutFile('FILES_OUT',       \@newMastList,\&neRule,'item',0,1);
+    $tFailCount += createOutFile('DEP_FILES_OUT',   \@newMastList,\&neRule,'item',0,0);
+    $tFailCount += createOutFile('OLDFILES_OUT',    \@oldMastList,\&neRule,'item',0,1);
+    $tFailCount += createOutFile('DEP_OLDFILES_OUT',\@oldMastList,\&neRule,'item',0,0);
+    $tFailCount += createOutFile('PKGNAMES_OUT',    \@newMastList,\&neRule,'n',   1,1);
+    $tFailCount += createOutFile('DEP_PKGNAMES_OUT',\@newMastList,\&neRule,'n',   1,0);
+    $tFailCount += createOutFile('OLDPKGNAMES_OUT', \@oldMastList,\&neRule,'n',1,1);
+    $tFailCount += createOutFile('DEP_OLDPKGNAMES_OUT',\@oldMastList,\&neRule,'n',1,0);
+
+    my @obsMastList = ();
+    map { push @obsMastList,$_ if ($_->{type} eq 'obs'); } @mastList;
+    $tFailCount += createOutFile('OBSFILES_OUT',\@obsMastList,\&neRule,'item',0,-1);
+    $tFailCount += createOutFile('OBSPKGNAMES_OUT',\@obsMastList,\&neRule,'n',1,-1);
+
+    $outFile = $fNames->{OBSPKGNAMES_OUT};
+    $outFileFull = "$outDir/$outFile"; $written = 0;
+    if (open(OBSCOMPAT,">>$outFileFull")) {
+        foreach my $n (sort(keys(%$findObsHR))) {
+            print OBSCOMPAT "${n}\n";
+            $written++;
+        }
+        close(OBSCOMPAT);
+        doLog($TPSTXT,$TPSLOG,"Appended $written items to $outFile\n");
+    } else {
+        doLog($TPSFAILTXT,$TPSRPT,"Cannot append to $outFile in $outDir: $!\n");
+        $tFailCount++;
+    }
+
+    ######
+    ## Build Requirements Info is gathered here
+    $tFailCount++ unless ('PASS' eq (gatherBuildReqs($outDir,1,\@mastList)));
+
+    ##### Master List is dumped as xml, at least for now.
+    $outFile = "files-master.xml"; $outFileFull = "$outDir/$outFile";
+    write_master_list($outFileFull, @mastList)
+        or $tFailCount++;
+
+    $tResult = 'PASS' if (0 == $tFailCount);
+    $overallResult = endTest($tResult,$tName);
+    $failCount++ if ($overallResult ne 'PASS');
+
+    # ================================================================
+    $tName = "Check for Arch Changes";
+    # ================================================================
+    $tWarnCount = 0; $tFailCount = 0; $tResult = 'PASS';
+    beginTest($tName);
+    # This test will issue a WARN if there are any changes in arch.
+    # Such changes may well be intentional; do *not* fail the run
+    # if any are encountered.
+    $tWarnCount = checkArchChange(\@oldMastList,\@newMastList);
+    if ($tWarnCount > 0) {
+        $tResult = 'WARN';
+    } else {
+        doLog($TPSTXT,$TPSLOG,"No changes in package architectures were detected.\n");
+    }
+    endTest($tResult,$tName);
+    # ================================================================
+
+    ## TODO:
+    #   * write missing tests
+    #   * generate other required files, see above.
+    #  Check current channel subs
+    # Modify Dest Channels based on:
+    #       - existing subs
+    #       - errata channel list
+    # Add errata Deps:
+    #   Add to hash: IsDepErrata
+    #     so that primary/2ndary files can be ID'd.
+    # Consider URLs / download.devel
+    #
+
+    doLog($TPSTXT,$TPSLOG,"\nTotal failures observed: $failCount\n");
+    $overallResult = 'FAIL' if (0 != $failCount);
+    doLog($TPSRESULT,$TPSRPT,"\nOVERALL TEST RESULT: TPS-MAKE-LISTS: $overallResult\n");
+    closeLogFileSet();
+    `tps-markup -l ${outDir}/tps-make-lists.raw -o $outDir/tps-make-lists.html >/dev/null 2>&1`;
+    exit 0 if (0 == $failCount);
+    exit 1;
+}

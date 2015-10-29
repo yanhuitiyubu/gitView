@@ -1,0 +1,175 @@
+#!/bin/bash
+
+# yum equivalent of up2date --nox --show-channels
+# Plenty of kludges due to inconsistent yum/yum-rhn-plugin behavior.
+
+## options:
+##  [none]    : list all enabled yum repos, local+plugins
+##  all       : enabled + disabled repos
+##  noplugins : local repos only
+
+## Thus:
+##  all enabled:    [none]
+##  local enabled:  noplugins
+##  local disabled: noplugins all
+##  If no-local is desired, --disablerepo="list of local repos" needs to be 
+##    assembled by the caller and used separately.
+
+# Depending on the version of yum, the following strategies may or may not be valid:
+#  If yum >= 3.2.22 && yum-rhn-plugin >= 0.5.4-22, rhn channels are here:
+#    cat /var/cache/yum/rhnplugin.repos | awk '{ print $1 }'
+#    Or places like: /var/cache/yum/i386/6Server/rhnplugin.repos
+#  If rhn-setup is installed, rhn channels are here:
+#    /usr/sbin/rhn-channel -l
+#  Enabled Local + Plugin repos, for yum >= 3:
+#    yum -v repolist 2>&1 | grep -i '^repo-id' | awk '{ print $NF }'
+#  Enabled Local repos for yum >= 3:
+#    yum --noplugins -v repolist 2>&1 | grep -i '^repo-id' | awk '{ print $NF }'
+#  Where the above don't work:
+#    tps-yum-show-channels-old [options]
+#  Disabled local repos:
+#    tps-yum-show-channels-old --noplugins --all
+#  Note that without -v, yum will print additional things
+#  that need to be discarded.
+#  Note that _with_ -v, it will print several screenfuls of
+#  useless nattering if any of the baseurls is (404) unusable.
+
+#  Notes:
+#    This tool has nothing to do with 'subscription-manager',
+#  or any other means of setting/restoring subscriptions.
+
+function do_help {
+cat <<EOF
+Usage: $(basename $0) [--all] [--noplugins]
+  Lists yum repo names.
+
+  No args     : lists enabled local and plugin repos
+  --all       : lists enabled and disabled repos
+  --noplugins : lists local repos
+  --help      : you are currently reading it.
+
+  Unrecognized arguments are fed along to yum, unless
+  the --all option is used.  Anything after a yum argument
+  is also passed to yum.
+
+EOF
+}
+
+OPT_NONE=true
+OPT_ALL=false
+OPT_NOPLUGINS=false
+OPT_EXTRA=false
+OPT_VERBOSE=false
+
+while true ; do
+  case "$1" in
+      '')      break ;;
+      --all)
+	  OPT_NONE=false
+	  OPT_ALL=true
+	  ;;
+      --noplugins)
+	  OPT_NONE=false
+	  OPT_NOPLUGINS=true
+	  ;;
+      -h)      
+	  do_help 
+	  exit 0 
+	  ;;
+      --help)      
+	  do_help 
+	  exit 0 
+	  ;;
+      --debug)
+	  OPT_VERBOSE=true
+	  ;;
+      *)  
+	  OPT_EXTRA=true
+	  break 
+	  ;;
+  esac
+  shift
+done
+
+YUM_ARGS='-e 1'
+$OPT_NOPLUGINS && YUM_ARGS="${YUM_ARGS} --noplugins"
+! $OPT_ALL && $OPT_EXTRA && YUM_ARGS="${YUM_ARGS} $@"
+YUM_EXTRA=''
+export YUM_ARGS
+export YUM_EXTRA
+export OPT_VERBOSE
+
+function yum_repolist {
+    YUM_EXTRA=$@
+    local repoList=''
+    local rc=0
+    $OPT_VERBOSE && echo "Running: yum $YUM_ARGS repolist $YUM_EXTRA"
+    repoList=$(yum $YUM_ARGS repolist $YUM_EXTRA 2>&1)
+    rc=$?
+    # Yum seems addicted to putting random useless crud into its
+    # listings.  Among the annoying habits are:
+    #   - appending "/$ARCH" to the repo ID.  Attempting
+    #     to actually _use_ that form of ID leads to
+    #     a fatal error from yum, since it's NOT the ID.
+    #   - Preceding the repo ID with "!" or "*", which again
+    #     causes failure if used.
+    # This comment applies to yum-3.4.3-118.el7.  Other
+    # versions/distros, due to yum being yum, are
+    # almost guaranteed to differ.
+    if echo "$repoList" | grep -qsie '^repo.id' ; then
+        # $OPT_VERBOSE && echo 'found repo.id'
+        if echo "$YUM_EXTRA" | grep -qsve 'abled'; then
+	    echo "$repoList" | egrep -i '(en|dis)abled' | awk '{ print $1 }' | grep -v repolist: | sed -e 's/^[*!]//g; s#/.*##g' | sort | uniq
+        else
+            echo "$repoList" | sed -e '0,/^repo.id /d' | grep -v repolist: | awk '{ print $1 }' | sed -e 's/^[*!]//g; s#/.*##g' | sort | uniq
+        fi
+    else
+        $OPT_VERBOSE && echo 'WARNING: standard list with repo.id NOT FOUND'
+	# We probably got some form of yum error, and our caller
+	# probably wants to see it.  Um, but not always.
+	if [ $rc -ne 0 ]; then
+	    echo "$repoList"
+	elif echo "$repoList" | grep -qsie 'abuse'; then
+	    echo "$repoList"
+	    rc=1
+	elif echo "$repoList" | grep -qsie 'error'; then
+	    echo "$repoList"
+	    rc=1
+	elif echo "$repoList" | grep -qsie 'traceback'; then
+	    echo "$repoList"
+	    rc=1
+	elif echo "$repoList" | grep -qsie 'rhn_register'; then
+	    echo "$repoList"
+	    rc=1
+	else
+	    # print nothing, return success
+            $OPT_VERBOSE && echo "IGNORING: $repoList"
+	    rc=0
+	fi
+    fi
+    return $rc
+}
+
+if ! $OPT_ALL ; then
+    # List of enabled repos, including plugins...
+    yum_repolist enabled
+    exit $?
+fi
+
+# else if we _do_ have --all:
+
+# Old method for doing things:
+#   Need list of disabled local repos
+#     via tps-yum-show-channels-old --noplugins --all 2>/dev/null
+#   Plus a list of enabled repos, via:
+#     yum $YUM_ARGS -v repolist
+# $OPT_VERBOSE && echo "Running: tps-yum-show-channels-old --noplugins --all"
+# $OPT_VERBOSE && echo "Running: yum $YUM_ARGS -v repolist"
+#
+# ( tps-yum-show-channels-old --noplugins --all 2>/dev/null ;
+#     yum_repolist
+# ) 2>&1 | sort | uniq
+
+## New method
+yum_repolist all
+

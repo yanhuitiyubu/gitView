@@ -1,0 +1,24 @@
+<table class="eso-table">
+	<thead>
+		<tr>
+			<th>Developer name</th>
+			<th>Email</th>
+			<th>Total Commits</th>
+			<th>Total lines</th>
+			<th>Total Inserted(+)</th>
+			<th>Total Deleted(-)</th>
+		</tr>
+	</thead>
+	<tbody>
+		{%for developer in developers %}
+		<tr>
+			<td>{{developer.info.full_name}}</td>
+			<td>{{developer.info.email}}</td>
+			<td>{{developer.commits_count}}</td>
+			<td>{{developer.total_lines}}</td>
+			<td>{{developer.lines_inserted}}</td>
+			<td>{{developer.lines_deleted}}</td>
+		</tr>
+		{%endfor%}
+	</tbody>
+</table>

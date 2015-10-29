@@ -1,0 +1,104 @@
+To build a scratch (testing) release:
+
+    $ rm -rf _rpmbuild
+    $ make srpm
+    $ brew build --scratch dist-4E-eso _rpmbuild/tps-*src.rpm
+
+To build a real release:
+
+    1) merge onto master
+
+       $ git co master
+       $ git merge develop
+
+    2) Update specfile
+
+       $ make spec VR=X.Y.Z        ! e.g. VR=2.44.4
+       $ $EDITOR *.spec            ! edit %changelog
+       $ git commit *spec
+
+    3) Tag
+
+       $ git tag -a VERSION -m"You have to say something here"
+            * VERSION is normally just VERSION, no -RELEASE. But if you
+              need to respin with changes only to the specfile, you
+              can (and should) use VERSION-RELEASE.
+
+    4) Build SRPM and scratch build
+
+       $ rm -rf _rpmbuild
+       $ make srpm
+       $ brew build --scratch dist-4E-eso _rpmbuild/tps-*src.rpm
+
+    5) If there are problems: you can still make and commit changes,
+       git tag -d VERSION, and go back to step 3.
+
+    6) Once you are happy with the scratch build, push to git master
+       and make a real build:
+
+       $ git push && git push --tags
+       $ !brew:gs/--scratch//
+
+    7) Merge back onto develop:
+
+       $ git checkout develop && git merge master && git push
+
+Deploying:
+
+About (Optional) Release Helpers:
+    Sometimes a new version of tps-client requires a new version of
+    oats; or perhaps there are other changes that need to be made to
+    allow tps to continue operating smoothly.  To make stable systems
+    update themselves and run the necessary steps, you can use a
+    Release Helper.  See the existing scripts in the release_helpers/
+    directory for inspiration.  The name *must* match the format of
+    helper-tpsUpdate-$V-$R.
+
+To deploy a test release (Optional):
+    Purpose:  make packages available for RHEL-QE's automated testing
+    If this isn't your goal, please skip down to "deploy a real release."
+    1) scp the scratch build output (tps-{devel,polling}*.noarch.rpm to:
+       root@qesat.lab.bos.redhat.com:/mnt/tpsdist/test/
+    2) ssh root@qesat.lab.bos.redhat.com and:
+       # cd /mnt/tpsdist/test
+       # ln -snf tps-polling-*.noarch.rpm tps-polling.noarch.rpm
+       # ln -snf tps-devel-*.noarch.rpm tps-devel.noarch.rpm
+
+To deploy a real release:
+    0) Set variables to follow these examples.  Do so locally, and on
+       any machines you login to for this release process.  Example:
+       $ V=2.44.3  ; # Version
+       $ R=4       ; # Release
+       This corresponds to tps-{polling,devel}-2.44.3-4.noarch.rpm.
+
+    1) If this release uses a helper script:
+       $ scp release_helpers/helper-tpsUpdate-$V-$R \
+         root@qesat.lab.bos.redhat.com:/mnt/tpsdist/
+
+    2) Copy the files from brew to /mnt/tpsdist:
+       $ scp /mnt/redhat/brewroot/packages/tps/$V/$R/noarch/tps-{polling,devel,stacks}-$V-$R.noarch.rpm \
+         root@qesat.lab.bos.redhat.com:/mnt/tpsdist/
+
+       At this point, you may pause and perform any last-minute checks
+       you might find useful or comforting.  At this point, nothing has
+       updated itself.  The next step, setting the links, will cause
+       dozens of machines to update themselves.  See README.staging for
+       details.
+
+    3) Login, and set the links; if needed, also fix the links that were used
+       for testing.  As soon as the links are set, the stable systems will
+       begin updating themselves.
+       # cd /mnt/tpsdist/
+       # for i in polling devel stacks ; do
+            ln -snf tps-$i-$V-$R.noarch.rpm tps-$i.noarch.rpm
+         done
+
+       # cd /mnt/tpsdist/test
+       # for i in polling devel ; do
+             ln -snf ../tps-$i.noarch.rpm tps-$i.noarch.rpm
+         done
+
+Post-release tasks:
+  - Announce the new release to the user base.  At a minimum, this means
+    mail to tps-dev-list.  Consider a wider audience for big releases.
+  - Close out associated bugzillas and Jira tasks.

@@ -1,0 +1,22 @@
+<table class="eso-table">
+	<thead>
+		<tr>
+			<th>Project name</th>
+			<th>Total Commits</th>
+			<th>Total lines</th>
+			<th>Total Inserted(+)</th>
+			<th>Total Deleted(-)</th>
+		</tr>
+	</thead>
+	<tbody>
+		{% for project in projects %}
+		<tr>
+			<td>{{project.project_name}}</td>
+			<td>{{project.commits_count}}</td>
+			<td>{{project.total_lines}}</td>
+			<td>{{project.lines_inserted}}</td>
+			<td>{{project.lines_deleted}}</td>
+		</tr>
+		{% endfor %}
+	</tbody>
+</table>

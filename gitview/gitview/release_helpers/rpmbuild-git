@@ -1,0 +1,664 @@
+#!/usr/bin/perl
+#
+# rpmbuild-git - build (s)rpm from git sources
+#
+# $Id$
+#
+package TPS::RpmBuild::Git;
+
+use strict;
+use warnings;
+
+(our $ME = $0) =~ s|.*/||;
+(our $VERSION = '$Revision: 0.0 $ ') =~ tr/[0-9].//cd;
+
+# For debugging, show data structures using DumpTree($var)
+#use Data::TreeDumper; $Data::TreeDumper::Displayaddress = 0;
+
+###############################################################################
+# BEGIN user-customizable section
+
+# Where generated (s)rpms go. Relative path under our working dir.
+our $Destdir = '_rpmbuild';
+
+# END   user-customizable section
+###############################################################################
+
+use Cwd                 qw(abs_path);
+use File::Path          qw(rmtree);             # For cleaning up tempdir
+use File::Temp          qw(tempdir);
+use Time::Piece;
+
+###############################################################################
+# BEGIN boilerplate args checking, usage messages
+
+sub usage {
+    # This is a long help message. Be kind to our reader.
+    if (-t *STDOUT) {
+        my $pager = $ENV{MANPAGER} || $ENV{PAGER} || 'less';
+        open STDOUT, '|-', $pager
+            or die "$ME: FATAL: Could not reopen STDOUT: $!";
+    }
+
+    print  <<"END_USAGE";
+Usage: $ME [OPTIONS] [RPMBUILD-OPTIONS]
+
+$ME creates RPM builds from the current branch. Typical
+invocation is:
+
+    \$ $ME [-bs | -bb | -ba] [--define "dist .el6"]
+
+This will build a source / binary / all rpm(s) using the latest git.
+The build RPM will have a distinctive V-R; its naming convention is:
+
+    <name>-<version>-0.git.<count>.<sha>
+
+where:
+
+    <name>    is the package name (basename of *.spec) (good enough for me)
+    <version> is the most recent git tag, with rightmost decimal incremented
+              by 1. E.g. if last git tag is 2.3.9, version is 2.3.10
+    <count>   is the number of git commits since the last tag.
+    <sha>     is the SHA sum of HEAD.
+
+This scheme makes it likely that you can yum-upgrade to successive
+builds, but NO GUARANTEES! In particular:
+
+  * If you branch at <tag>, then build on one branch with 3 commits,
+    then build on another with 1, it won't matter that the latter is
+    more recent. 0.git.3.* beats 0.git.1.*.
+  * If you build, then git-commit --amend, then rebuild, the new SHA
+    may collate before the old one: 0.git.1.def beats 0.git.1.abc
+    even if abc is the new one.
+
+$ME creates a tarball (using git archive) in a temporary
+working directory, creates a temporary specfile with Version and
+Release updated and with a %changelog derived from git commits,
+then runs rpmbuild (including your command-line arguments).
+Generated (s)rpms are written to the $Destdir subdirectory.
+
+$ME must be run from the top-level directory of a git checkout.
+The git directory must be clean (no modified files).
+
+OPTIONS:
+
+  --show-vr            Display Version-Release and exit. Useful for just
+                       getting a sense of what a build would be called.
+
+  --write-specfile     Just write a new specfile and exit. The specfile
+                       will not be git-committed: that's up to you (after
+                       review, of course). The specfile will include
+                       a new %changelog stanza as described above. It
+                       will also include updated Version and Release
+                       definitions, by default Next-Version and 1
+                       respectively. Use --force-version to override.
+                       This can be useful prior to a real release.
+
+  --force-version=V    Force RPM Version to V instead of (last+1).
+                       RPM Release will still be 0.git.<whatever>, unless:
+  --force-version=V-R  ...the string includes a hyphen. In this case both
+                       Version and Release will be set to what you say.
+
+  --force-git-unclean  Proceed with rpmbuild even if your git working
+                       directory contains uncommitted changes. This is
+                       almost always a bad idea.
+
+  --force-release-from=BRANCH
+                       Proceed with a tagged build even if your git branch
+                       is not 'master' or 'hotfix-*'. This, too, is probably
+                       a bad idea. BRANCH must be the current branch name.
+
+  --destdir=DIR        Write generated RPMs to DIR (default: $Destdir).
+                       This is passed to rpmbuild via --define _rpmdir
+                       and _srcrpmdir. The directory does not need to
+                       exist; rpmbuild will create it if necessary.
+
+  -v, --verbose  show verbose progress indicators
+  -n, --dry-run  make no actual changes
+
+  --help         display this message
+  --man          display program man page
+  --version      display program name and version
+
+RPMBUILD-OPTIONS:
+
+All other options are passed along to rpmbuild. Useful options:
+
+    -bs    build srpm
+    -bb    build binary rpm
+    -ba    build both source and binary rpms
+
+    --define "dist .el6"    [...or .el6eso, or whatever]
+
+See rpmbuild(1) for more information.
+END_USAGE
+
+    close STDOUT;
+    exit;
+}
+
+sub man {
+    # Read the POD contents.  If it hasn't been filled in yet, abort.
+    my $pod = do { local $/; <DATA>; };
+    if ($pod =~ /=head1 \s+ NAME \s+ FIXME/xm) {
+        warn "$ME: No man page available.  Please try $ME --help\n";
+        exit;
+    }
+
+    # Use Pod::Man to convert our __DATA__ section to *roff
+    eval { require Pod::Man }
+        or die "$ME: Cannot generate man page; Pod::Man unavailable: $@\n";
+    my $parser = Pod::Man->new(name => $ME, release => $VERSION, section => 1);
+
+    # If called without output redirection, man-ify.
+    my $out_fh;
+    if (-t *STDOUT) {
+        my $pager = $ENV{MANPAGER} || $ENV{PAGER} || 'less';
+        open $out_fh, "| nroff -man | $pager";
+    }
+    else {
+        open $out_fh, '>&STDOUT';
+    }
+
+    # Read the POD contents, and have Pod::Man read from fake filehandle.
+    # This requires 5.8.0.
+    open my $pod_handle, '<', \$pod;
+    $parser->parse_from_filehandle($pod_handle, $out_fh);
+    exit;
+}
+
+
+# Command-line options.  Note that this operates directly on @ARGV !
+our $debug   = 0;
+our $force_version;
+our $force_git_unclean;
+our $force_release_from = '';
+our $write_specfile;
+our $show_vr;
+our $verbose = 0;
+our $NOT     = '';              # print "blahing the blah$NOT\n" if $debug
+sub handle_opts {
+    use Getopt::Long    qw(:config pass_through);
+    GetOptions(
+        'destdir=s'            => \$Destdir,
+        'force-version=s'      => \$force_version,
+        'force-git-unclean'    => \$force_git_unclean,
+        'force-release-from=s' => \$force_release_from,
+        'write-specfile'       => \$write_specfile,
+        'show-vr!'             => \$show_vr,
+
+        'debug!'     => \$debug,
+        'dry-run|n!' => sub { $NOT = ' [NOT]' },
+        'verbose|v'  => \$verbose,
+
+        help         => \&usage,
+        man          => \&man,
+        version      => sub { print "$ME version $VERSION\n"; exit 0 },
+    ) or die "Try `$ME --help' for help\n";
+}
+
+# END   boilerplate args checking, usage messages
+###############################################################################
+
+############################## CODE BEGINS HERE ###############################
+
+# The term is "modulino".
+__PACKAGE__->main()                                     unless caller();
+
+# Main code.
+sub main {
+    # Note that we operate directly on @ARGV, not on function parameters.
+    # This is deliberate: it's because Getopt::Long only operates on @ARGV
+    # and there's no clean way to make it use @_.
+    handle_opts();                      # will set package globals
+
+    # It doesn't make much sense to invoke us without -ba, -bs, etc
+    (@ARGV || $write_specfile || $show_vr)
+        or die "$ME: You probably want to call me with -b<x>; see $ME --help\n";
+
+    assert_git_clean();
+
+    # Last tagged release
+    my $git_last_tag = git_last_tag();
+
+    # From that tag, compute an RPM Version/Release for this build
+    my ($rpm_version, $rpm_release) = git_next($git_last_tag);
+    # ...but allow overriding the version.
+    if (defined $force_version) {
+        if ($force_version =~ /^(.*)-(.*)$/) {          # eg 1.2-3 => (1.2, 3)
+            ($rpm_version, $rpm_release) = ($1, $2);
+        }
+        else {                                          # eg 1.2 => (1.2, '0.*')
+            $rpm_version = $force_version;
+        }
+    }
+
+    # Helpful for dev to see what we would do
+    if ($show_vr) {
+        print $rpm_version, "-", $rpm_release, "\n";
+        exit 0;
+    }
+
+    # From the last tag, get a changelog
+    my @changelog = git_changelog($git_last_tag);
+
+    # Special case: --write-specfile just writes a new specfile in-place.
+    if ($write_specfile) {
+        # If invoked with --force-version=V-R, keep R.
+        # If just --force-version=V, or not at all, assume this is intended
+        # for actual release and set R=1.
+        $rpm_release = '1' if $rpm_release =~ /git/;
+        my $spec = temp_specfile('.', $rpm_version, $rpm_release, @changelog);
+        exit 0;
+    }
+
+    # Create a temporary working directory. We will write a tarball here,
+    # and a custom specfile, then let rpmbuild do all its work.
+    # We don't use CLEANUP because we want to preserve tmpdir if we die on error
+    my $tempdir = tempdir("$ME.XXXXXXX", TMPDIR => 1);
+
+    # Directory into which rpmbuild should write RPMs
+    my $outdir = abs_path($Destdir)
+        or die "$ME: Internal error: no $Destdir subdirectory\n";
+
+    # Make a tarball
+    my $tarball = git_archive($tempdir, $rpm_version, $git_last_tag);
+
+    my $spec = temp_specfile($tempdir, $rpm_version, $rpm_release, @changelog);
+
+    # Invoke rpmbuild
+    my @rpmbuild = ('rpmbuild',
+                    '--define' => "_source_filedigest_algorithm 1",
+                    '--define' => "_binary_filedigest_algorithm 1",
+                    '--define' => "_binary_payload w9.gzdio",
+                    '--define' => "_source_payload w9.gzdio",
+                    '--define' => "_topdir    $tempdir",
+                    '--define' => "_sourcedir $tempdir",
+                    '--define' => "_specdir   $tempdir",
+                    '--define' => "_rpmdir    $outdir",
+                    '--define' => "_srcrpmdir $outdir",
+                    @ARGV,
+                    $spec);
+    system(@rpmbuild) == 0
+        or die "$ME: Command failed: @rpmbuild\n";
+
+    # Alles gut! Clean up
+    rmtree($tempdir, 0) unless $debug;
+}
+
+###############################################################################
+# BEGIN work with specfile
+
+###################
+#  temp_specfile  #  Updated with custom Version, Release, and Changelog
+###################
+sub temp_specfile {
+    my ($tempdir, $v, $r, @changelog) = @_;
+
+    my %replace = (version => $v, release => $r);
+
+    my $spec = specfile();
+    my $spec_new = "$tempdir/$spec";
+    my $spec_tmp = "$spec_new.tmp.$$";
+    unlink $spec_tmp;
+
+    open my $fh_in, '<', $spec      or die "$ME: Cannot read $spec: $!\n";
+    open my $fh_out, '>', $spec_tmp or die "$ME: Cannot create $spec_tmp: $!\n";
+    while (my $line = <$fh_in>) {
+        $line =~ s{^((Version|Release)\s*:\s+)(.*)$}{
+            my ($lhs, $key, $rhs) = ($1, lc($2), $3||'');
+
+            # Preserve '%{?dist}' in Release.
+            # There has to be a better way to do this.
+            my $dist = '';
+            $dist = $1 if $rhs =~ /(%\{.*)/;
+
+            $lhs . $replace{$key} . $dist;
+        }ie;
+        print { $fh_out } $line;
+        if ($line =~ /^\%changelog/ && @changelog) {
+            print { $fh_out } new_stanza($v,$r);
+            print { $fh_out } $_ for @changelog;
+            print { $fh_out } "\n";
+        }
+    }
+
+    close $fh_in;
+    close $fh_out or die "$ME: Error writing $spec_tmp: $!\n";
+
+    # Rename into place. This is safe because we don't overwrite the true spec
+    rename $spec_tmp => $spec_new;
+
+    system('diff', '-uw', $spec, $spec_new);    # FIXME: unless $quiet?
+
+    return $spec_new;
+}
+
+################
+#  new_stanza  #  Returns '* <date> <author> <v-r>\n" changelog entry
+################
+sub new_stanza {
+    my ($v, $r) = @_;
+
+    my $now    = localtime->strftime('%a %b %e %Y');       # eg Fri Feb  6 2015
+    my ($who)  = git('config', '--get' => 'user.name');
+    my ($mail) = git('config', '--get' => 'user.email');
+
+    return "* $now $who <$mail> $v-$r\n";
+}
+
+##############
+#  specfile  #  Finds *.spec in cwd
+##############
+sub specfile() {
+    my @candidates = glob('*.spec')
+        or die "$ME: No *.spec files found in cwd\n";
+    if (@candidates == 1) {
+        return $candidates[0];
+    }
+    die "$ME: Cannot find specfile: multiple possibilities: @candidates\n";
+}
+
+# END   work with specfile
+###############################################################################
+# BEGIN getting git info
+
+######################
+#  assert_git_clean  #  Modified files will not be in the tarball!
+######################
+sub assert_git_clean {
+    my @touched = git('status', '--short', '--untracked=no');
+    return if !@touched;
+    warn "$ME: Your git directory contains uncommitted changes:\n\n";
+    warn "    $_\n" for @touched;
+    warn "\nRemember, $ME uses git-archive to create a tarball.\n";
+    warn "Uncommitted changes will not be in the packaged rpm.\n";
+    warn "\n";
+    if ($force_git_unclean) {
+        warn "$ME: Proceeding due to --force-git-unclean\n";
+        return;
+    }
+    die "$ME: Aborting. See --help if you really think you want to proceed.\n";
+}
+
+##############################
+#  assert_on_release_branch  #  Tagged builds can only come from master/hotfix
+##############################
+sub assert_on_release_branch {
+    my ($branch) = git('rev-parse', '--abbrev-ref', 'HEAD');
+    return if $branch eq 'master' || $branch =~ /^hotfix-/;
+
+    warn <<"END_WARNING";
+$ME: you are building from a tag on branch $branch.
+    Tagged builds are intended only for release, and must come from
+    branch 'master' or 'hotfix-<*>'.
+END_WARNING
+    if ($force_release_from eq $branch) {
+        warn "$ME: Proceeding due to --force-release-from\n";
+        return;
+    }
+    die "$ME: Aborting. See --help if you really think you want to proceed.\n";
+}
+
+##################
+#  git_last_tag  #  Return the most recent annotated tag
+##################
+sub git_last_tag {
+    # Note that we deliberately avoid --all: that would give us *all* tags.
+    # We want only annotated ones, because those are the ones that contribute
+    # to actual releases.
+    my ($tag) = git('describe', '--abbrev=0', 'HEAD');
+    print "[ git last tag : $tag ]\n"                   if $debug;
+    return $tag;
+}
+
+##############
+#  git_next  #  Returns RPM (version, release) for building an rpm
+##############
+sub git_next {
+    my $tag = shift;                    # in: git tag
+
+    # First of all: we're returning rpm version and release strings. Neither
+    # can include a dash (e.g: given foo-1.2-3-4, what are N, V, R?). But
+    # our git tag might include a dash if someone tagged a -2 or -3 release.
+    # Make sure we convert those to something safe.
+    # FIXME: any better suggestions than . (dot)?
+    (my $tag_v = $tag) =~ tr/-/./;
+
+    # Invoking in scalar mode gives us the number of commits.
+    # If it's zero (HEAD == tag), return just the tag.
+    my $commit_count = git('rev-list', "$tag..HEAD");
+    if ($commit_count == 0) {
+        assert_on_release_branch();
+
+        # This is more complicated than I'd like. The intent is to deal with
+        # hyphenated tags, eg 1.2-3. If the git tag has exactly one dash,
+        # assume the developer knows what s/he's doing.
+        if ($tag =~ /^([^-]+)-([^-]+)$/) {
+            return ($1, $2);            # eg (1.2, 3)
+        }
+        else {
+            # Expected case: no dashes. Return version, with '1' as release.
+            # (This also handles the more-than-one-dash case, eg 1.2-3-4.
+            # We assume here that dev is clueless and should be protected).
+            return ($tag_v, '1');
+        }
+    }
+
+    # More than one commit. This is the usual case for a test build.
+    # Bump up the last element of the version string, and form a release
+    # string from the commit count and SHA.
+    (my $rpm_version = $tag_v) =~ s/^(.*)\.(\d+)$/sprintf("%s.%d",$1,$2+1)/e;
+
+    my ($commit_sha) = git('rev-parse', '--short', 'HEAD');
+    my $rpm_release = "0.git.${commit_count}.${commit_sha}";
+
+    return ($rpm_version, $rpm_release);
+}
+
+###################
+#  git_changelog  #  Return a changelog since a given tag
+###################
+sub git_changelog {
+    my $tag = shift;                    # in: tag of last release
+
+    my @git_log = git('log', '--pretty=oneline', "$tag..HEAD");
+    my (%by_bz, @others);
+    for my $line (reverse @git_log) {
+        $line =~ s/^[0-9a-f]+\s+//;     # Strip off SHA
+        $line =~ s/^Merge\s+"(.*)"\s+into\s.*$/$1/;
+
+        # Look for common 'bzXYZ' patterns
+        # The 'unless' in the two cases below deals with git merges, eg Gerrit,
+        # in which we can get multiple lines for the same actual commit.
+        if ($line =~ s/^(fix\s+)?(bz|bug)[\s\#]*(\d+)[\s,:-]+//i) {
+            $by_bz{$3} .= "- bz$3 - $line\n"
+                unless ($by_bz{$3}||'') =~ /\Q$line\E/;
+        }
+        else {
+            push @others, "- $line\n"
+                unless grep /\Q$line\E/, @others;
+        }
+    }
+
+    my @bzs = map { $by_bz{$_} } sort { $a <=> $b } keys %by_bz;
+    return (@bzs, @others);
+}
+
+
+#########
+#  git  #  Return output from git command
+#########
+sub git {
+    my @retval;
+    print "\$ git @_\n"                                 if $debug;
+    open my $git_fh, '-|', 'git', @_
+        or die "$ME: Cannot fork: $!\n";
+    while (my $line = <$git_fh>) {
+        print ">> ", $line                              if $debug;
+        chomp $line;
+        push @retval, $line;
+    }
+    close $git_fh
+        or die "$ME: Error running git @_: status=$?\n";
+
+    return @retval;
+}
+
+
+#################
+#  git_archive  #  Creates a tarball in a temp dir
+#################
+sub git_archive {
+    my ($tmpdir, $version, $git_tag) = @_;
+
+    (my $name = specfile()) =~ s/\.spec$//
+        or die "$ME: Internal error: Specfile does not end in .spec";
+
+    # FIXME: what if specfile expects .bz2?
+    my $tarball = "${tmpdir}/${name}-${version}.tar.gz";
+
+    # When packaging (e.g.) 2.4-* and we have a 2.4 tag, build the tarball
+    # from that. This way we don't have changing tarballs between releases.
+    # When version is not tagged, e.g. a git prebuild, just use latest.
+    my $version_to_package = ($version eq $git_tag ? $version : 'HEAD');
+
+    # Since we pipe through bzip, and redirect to an outfile, it's
+    # easier to do this via shell invocation than via clean perl IPC.
+    my $cmd = "git archive --format=tar --prefix=${name}-${version}/ $version_to_package | gzip >$tarball";
+
+    system($cmd) == 0
+        or die "$ME: Command failed: $cmd\n";
+
+    return $tarball;
+}
+
+
+
+
+
+# END   getting git info
+###############################################################################
+
+1;
+
+__DATA__
+
+###############################################################################
+#
+# Documentation
+#
+
+=head1	NAME
+
+rpmbuild-git - create rpm builds from current git tree
+
+=head1	SYNOPSIS
+
+rpmbuild-git [ -bs | -bb | -ba ] [ --define "dist .XXX" ]
+
+rpmbuild-git  B<--help>  |  B<--version> | B<--man>
+
+=head1	DESCRIPTION
+
+rpmbuild-git is a smart front end to rpmbuild. It figures out a
+proper N-V-R, uses git-archive(1) to create a tarball, tweaks
+the specfile, then builds one or more RPMs.
+
+=head1	OPTIONS
+
+=over 4
+
+=item B<--show-vr>
+
+Display computed Version-Release and exit. Useful for getting a
+sense of what a build would be called.
+
+=item B<--write-specfile>
+
+Just write a new specfile and exit. The specfile will not be git-committed:
+that's up to you (after review, of course). The specfile will include a
+new %changelog stanza as described above. It will also include updated
+Version and Release definitions, by default Next-Version and 1 respectively.
+Use --force-version to override. This option is how you prepare for a real
+release.
+
+=item B<--force-version=V>
+
+Force RPM Version to V instead of (last+1). RPM Release will still
+ be 0.git.<whatever>, unless:
+
+=item B<--force-version=V-R>
+
+...the string includes a hyphen. In this case both Version and Release
+ will be set to what you say.
+
+=item B<--force-git-unclean>
+
+Proceed with rpmbuild even if your git working directory contains
+uncommitted changes. This is almost always a bad idea.
+
+=item B<--force-release-from=BRANCH>
+
+Proceed with a tagged build even if your git branch is not 'master'
+or 'hotfix-*'. This, too, is probably a bad idea. BRANCH must be
+the current branch name.
+
+=item B<--destdir=DIR>
+
+Write generated RPMs to DIR (default: _rpmbuild). This is passed to
+rpmbuild via C<--define _rpmdir> and C<_srcrpmdir>. The directory does not
+need to exist; rpmbuild will create it if necessary.
+
+=item B<--verbose>
+
+Show progress messages.
+
+=item B<--help>
+
+Emit usage hints.
+
+=item B<--version>
+
+Display program version.
+
+=item B<--man>
+
+Display this man page.
+
+=back
+
+
+=head1	DIAGNOSTICS
+
+FIXME
+
+=head1	ENVIRONMENT
+
+rpmbuild-git must be invoked from the top of a git-controlled directory.
+
+=head1	FILES
+
+You probably want to create and commit a C<.gitattributes> file with
+the following content:
+
+    *.spec    export-ignore
+
+This will prevent *.spec from being part of the git-archive tarball.
+This in turn means that if you have to release a -2 or -3 or other
+build that differs only in the specfile, the tarball in the rpm will
+be the same.
+
+=head1	RESTRICTIONS
+
+FIXME
+
+=head1	SEE ALSO
+
+rpmbuild(8)
+
+=head1	AUTHOR
+
+Ed Santiago <santiago@redhat.com>
+
+=cut

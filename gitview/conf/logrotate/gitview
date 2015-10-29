@@ -1,0 +1,9 @@
+"/var/log/gitview/*.log" {
+  compress
+  missingok
+  notifempty
+  rotate 5
+  size 5M
+  weekly
+  dateext
+}

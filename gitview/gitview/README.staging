@@ -1,0 +1,186 @@
+TPS-Client Testing & Staging
+============================
+
+Prior to making a release, it's wise to try out the newly built rpm.
+
+There are several ways to do this, depending on your goals.
+Your goals should be at least one of:
+  - ensure smooth installation
+  - final testing of a fix/feature against live data/environment
+  - quick smoke test
+  - doing whatever verification that will let you feel warm and fuzzy
+    about putting this package onto dozens of machines.
+
+You should not be spending a lot of testing time here; that's for the
+git-builds, unit tests, and bugfixing that were part of the work
+already performed on this release. 
+
+Things to bear in mind:
+  - Most of the serious testing should have already been done at this
+    point via unit tests, functional tests of individual programs,
+    tests of git builds, etc.
+  - Items copied to /mnt/tpsdist and /mnt/tpsdist/test are not "seen"
+    by other scripts *until* you create the symlinks.  So it's okay to
+    copy the RPMs into place.  If they don't pass muster, just delete
+    them; nothing should be affected.
+  - Live data makes for a good test.  Remember that
+    /mnt/qa/scratch/$HOST/$ADVISORY/tps.mytest is a perfectly good place
+    from which to test; no results are seen unless you run tps-report or
+    tps-waive.  The worst that can happen is that a broken TPS might
+    damage the system upon which it's run, if you're playing with a
+    dangerous package (like, say, glibc or rpm).
+  - Collaborating with RHEL-QE is Good.  Someone who reported a
+    problem might know of a similar advisory that's on the way, and be
+    willing to test that against your new package.  That's one reason
+    that /mnt/tpsdist/test exists, for their convenience.
+
+OVERVIEW
+================================================
+
+ 1) INSTALL: Put the newly built packages onto /mnt/tpsdist.
+ 2) CHOOSE:  Pick one or more machines to test on.
+ 3) TEST:    Enable the new rpms, poke at them
+ 4) WRAP UP: Choose whether & how to tidy up
+ 5) RELEASE: Respin or go finish the release
+
+1) INSTALL
+---------------------------------------------------------
+   See README.build for the steps to build & put new rpms onto
+   /mnt/tpsdist.  STOP before setting the symlinks.
+
+   Alternatively, you can just use the direct brew output; after all,
+   systems set up to test errata already have access to
+   /mnt/redhat/brewroot/. 
+
+2) CHOOSE:  so where do you test this stuff?
+---------------------------------------------------------
+  2A) STABLE SYSTEM
+    References (Naming, passwords, lists of boxes): 
+     https://wiki.test.redhat.com/ReferenceManual/StableSystems/
+     https://wiki.test.redhat.com/ReferenceManual/StableSystems/NamingScheme
+     https://tps-server.lab.bos.redhat.com/systems/list/stable_sys
+    
+    Goal:  you want to test in a real enviroment, but not disturb the
+    queue.  So, the idea is to pick streams that are typically
+    low-volume.  These tend to be older RHELs, or older Z-streams.
+    For example, RHEL-5-Main-Server would be busier than
+    RHEL-5.9-Z-Server; the latter is usually the better choice.
+
+    Sometimes you won't have much choice.  For instance, right now
+    there aren't many RHEL-7 boxes.  In this case, look at:
+        wget -qO- http://errata-xmlrpc.devel.redhat.com/tps.txt
+    and see what's least likely to be disrupted.  Often you can use a
+    ComputeNode or Workstation machine.  Client and Server tend to be
+    the busiest. 
+
+  2B) BEAKER
+      b1) You can manually reserve a system, choosing the distro &
+           arch as appropriate.  Install OATS and TPS in the usual
+           way, paying careful attention to oats.conf to get the
+           TestProfile correct, and to disable OATS_INSTALL_STAR.
+      b2) You can try QE's "errata workflow" or "workflow tomorrow"
+          scenarios, which should configure a box to test a particular
+          erratum.  Contact the guys in BRQ for details & help:
+          azelinka, bnater, sgraf, and others.
+
+  2C) VM
+      c1) Having one's own collection of RHEL-X-Main-Server instances
+      on hand is an excellent testing option.
+
+  2D) RHEL-QE COLLABORATION
+      Things QE Knows Best:
+      - What's in the pipeline?
+      - Which advisories share key similarities?  Perhaps one that
+        broke TPS is now ShippedLive, but maybe there's another one
+        like it that would make for a good testing opportunity.
+      - Is the new look/feature you added really going to improve
+        their workflow, or would a tweak or two be in order?
+
+      Mail to tps-dev-list, and use of /mnt/tpsdist/test, are good
+      ways to collaborate and get feedback on features.  Some folks in
+      QE, like sgraf, have beaker tests that can automagically use
+      versions of tps in the test/ directory, and are great at
+      providing feedback as to whether your new.rpm solves their
+      particular issues.
+
+      For this type of collaboration, you should strongly consider
+      making a test release (see README.build) before making a final
+      production release.
+
+3) TEST
+--------------------------------------------------------
+  3a) Putting the new RPMs into play, either polling OR devel
+      a1) Manual install: tps-polling
+          Command:
+            tps-status && service tpsd stop && rpm -Uvh /path/to/new.rpm
+      a2) Manual install: tps-devel
+            rpm -Uvh /path/to/new.rpm
+
+  3b) Testing procedures
+      b1) Use /var/log/tpsd for inspiration: what was processed
+          recently?  Pick such an advisory number; we'll refer to it as
+          $RECENT here.
+      b2) If that fails, look at /mnt/qa/scratch/$(hostname -s)/ to
+          find recent runs.  We'll refer to `hostname -s` as $HOST
+          here.
+      b3) Make sure your advisory can be sanely tested.  Things like
+          tzdata are nice -- they're small and quick to run.  Things
+          like the latest SCL, MRG, or other Huge Advisories aren't so
+          nice -- unless your new release fixes a problem specific to
+          that advisory.  Remember that new-files*.list will give you
+          an idea as to how complex the advisory is.
+      b4) tps-cd $RECENT
+          cd ..
+          cp -r tps tps.mytest
+          cd tps.mytest/
+      b5) Remember that you can view the logs from the prior run via
+          http://nest.test.redhat.com/mnt/qa/scratch/$HOST/$RECENT/tps.mytest/
+          and that such viewing also gets you the links back into ET
+          plus assorted other useful stuff.
+      b6) If the advisory has not yet shipped (you can check ET), you
+          can re-run the full 'tps' or 'tps-rhnqa' and see what
+          transpires.  You can also run anything that tests changes
+          from the prior release -- tps-which, get-packages,
+          tps-query, whatever.  Be careful if using something that
+          could modify production data on other systems -- such as
+          tps-report.
+      b7) Manually poke.  The things that were changed in the release
+          should have been tested previously; however, poking at
+          potential problems is the way to be sure.
+      b8) CLEANUP:  If you're using a stable system, make sure to clean
+          up the aftereffects of any broken tps runs.  Tip:
+          tps-check-stable, if you run it, will provide a list of
+          things that were installed at the time.
+
+          Things that might need more cleanup: SELinux-policy
+          typically has issues when upgrading & downgrading; that sort
+          of thing.  Leave the currently released versions behind.
+
+     b9) Possibly enable the daemon.  If all is going well, it's okay
+         to enable the daemon on a stable system.  Any jobs that go
+         awry can be re-scheduled (check the tpsd log) after tps is
+         downgraded.  You probably don't want to run tpsd on a
+         non-stable-system, at least not without setting
+         TPS_LIMIT_CHANNELS_TO and (via tps-server TestProfile)
+         LayeredProductOnly beforehand, so that no jobs are
+         inadvertently stolen from the regular machines.
+
+4) WRAP UP:  Choose whether & how to tidy up
+------------------------------------------------------------------------
+    4a. Either Leave the new.rpm, if you intend to set the symlinks to
+        deploy it.
+    4b. Or downgrade to the prior release, if you'd rather have tpsd
+        update itself.
+           tps-status && service tpsd stop && rpm -Uvh --oldpackage /path/to/old.rpm
+    4c. If this is a stable system with tps-polling, remember to leave
+        a daemon running:
+            service tpsd start
+
+5) RELEASE: Respin or go finish the release
+------------------------------------------------------------------------
+    5a.  If things didn't go well, it's time to re-spin the RPM and
+         work your way through the lists again. 
+    5b.  If things went well, it's time to go back to README.build and
+         deploy the new RPMs.  Use those directions to copy the rpms &
+         helper scripts into place, and then trigger the update by
+         setting the symlinks.

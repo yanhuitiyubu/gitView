@@ -1,0 +1,122 @@
+{% extends "base.html" %}
+{% block customjs %}
+<script src="{{ STATIC_URL }}js/lib/jquery.plugin.js" type="text/javascript"></script>
+<script src="{{ STATIC_URL }}js/lib/jquery.datepick.js" type="text/javascript"></script>
+<script src="{{ STATIC_URL }}js/lib/bootstrap.min.js" type="text/javascript"></script>
+<script type="text/javascript" src="{{ STATIC_URL }}js/lib/underscore-min.js"></script>
+<script type="text/javascript" src="{{ STATIC_URL }}js/lib/linkage-select.js"></script>
+<script type="text/javascript" src="{{ STATIC_URL }}js/project-checkbox.js"></script>
+<script>
+	$(function() {
+		$('#datefrom').datepick({dateFormat: 'yyyy-mm-dd'});
+		$('#dateto').datepick({dateFormat: 'yyyy-mm-dd'});
+	});
+	$(window).load(function(){
+
+		/* Create our data objects.
+		 * Formatted like d3.js's nest() function.
+		 */
+
+		var project_list = $.parseJSON('{{project_list | escapejs}}');
+		var developer_list = $.parseJSON('{{developer_list | escapejs}}');
+		var branch_developer = $.parseJSON('{{branch_developer | escapejs}}');
+		var developer_branch = $.parseJSON('{{developer_branch | escapejs}}');
+
+		$(document).on('click', '#select-all-projects', function(e){
+			$('#projects').listTree('selectAll');
+		}).on('click', '#deselect-all-projects', function(e){
+			$('#projects').listTree('deselectAll');
+		}).on('click', '#expand-all-projects', function(e){
+			$('#projects').listTree('expandAll');
+		}).on('click', '#collapse-all-projects', function(e){
+			$('#projects').listTree('collapseAll');
+		});
+
+		$('#projects').listTree(project_list, { "startCollapsed": true, "selected": [], "linkRelation": branch_developer, "linkObject": $('#developers') });
+
+		$(document).on('click', '#select-all-developers', function(e){
+			$('#developers').listTree('selectAll');
+		}).on('click', '#deselect-all-developers', function(e){
+			$('#developers').listTree('deselectAll');
+		});
+
+		$('#developers').listTree(developer_list, { "startCollapsed": true, "selected": [], "linkRelation": developer_branch, "linkObject": $('#projects') });
+	});
+</script>
+{% endblock %}
+{% block customstyle %}
+<link rel="stylesheet" type="text/css" href="{{ STATIC_URL }}css/project-checkbox.css">
+<link rel="stylesheet" type="text/css" href="{{ STATIC_URL }}css/jquery.datepick.css" rel="stylesheet">
+{% endblock %}
+{% block breadcrumb %}
+<li><a href="{% url 'report-team' %}">Team Report</a> <span class="divider">/</span></li>
+{% endblock %}
+{% block content %}
+<div class="container">
+	<form name="team_report" action="{% url 'report-team' %}" method="get">
+		<div class="row-fluid">
+			<div class="span3"></div>
+			<div class="span6">
+				<table class="table">
+					<tr>
+						<td>Date From:</td>
+						<td>
+							<input type="text" id="datefrom" name="datefrom" value="{{ dateFrom | date:'Y-m-d'}}">
+						</td>
+						<td>Date To:</td>
+						<td>
+							<input type="text" id="dateto" name="dateto" value='{{ dateTo | date:"Y-m-d"}}'>
+						</td>
+						<td>
+							<input type="submit" value="Generate Report" type="button" class="btn btn-default"/></tr>
+						</td>
+					</tr>
+				</table>
+			</div>
+			<div class="span3"></div>
+		</div>
+		<table class="table" width="100%">
+			<tr>
+				<td width="33%">
+					<div class="mygrid-wrapper-div" />
+					<div class="navbar navbar-sub" role="navigation" margin-bottom="0px">
+						<div class="mynavbar-header">
+							<a class="mynavbar-brand">Projects</a>
+						</div>
+						<div class="mynav mynavbar-nav mynavbar-right">
+							<div class="dropdown pull-right">
+								<a class="dropdown-toggle" data-toggle="dropdown">More <b class="caret"></b></a>
+								<ul class="dropdown-menu" role="menu">
+								<li><a id="select-all-projects">Select All</a></li>
+								<li><a id="deselect-all-projects">Deselect All</a></li>
+									<li><a id="expand-all-projects">Expand All</a></li>
+									<li><a id="collapse-all-projects">Collapse All</a></li>
+								</ul>
+							</div>
+						</div>
+					</div>
+					<div class="listTree" id="projects"></div>
+				</td>
+				<td width="67%">
+					<div class="mygrid-wrapper-div" />
+					<nav class="navbar navbar-sub" role="navigation" margin-bottom="0px">
+						<div class="mynavbar-header">
+							<a class="mynavbar-brand">Team Members</a>
+						</div>
+						<div class="mynav mynavbar-nav mynavbar-right">
+							<div class="dropdown pull-right">
+								<a class="dropdown-toggle" data-toggle="dropdown">More <b class="caret"></b></a>
+								<ul class="dropdown-menu" role="menu">
+								<li><a id="select-all-developers">Select All</a></li>
+								<li><a id="deselect-all-developers">Deselect All</a></li>
+								</ul>
+							</div>
+						</div>
+					</nav>
+					<div class="listTree" id="developers"></div>
+				</td>
+			</tr>
+		</table>
+	</form>
+</div>
+{% endblock %}

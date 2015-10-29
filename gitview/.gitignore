@@ -1,0 +1,16 @@
+*.pyc
+*.swp
+*~
+*.pdf
+PDFs/
+cert/newca.crt
+log/refresh.log
+projects/
+static/report
+templates/report
+gitview/logfile/*
+.project
+.pydevproject
+gitview/.settings/*
+gitview/gitview/local_settings.py
+

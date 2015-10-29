@@ -1,0 +1,4 @@
+Django >=1.5, <1.6
+reportlab >= 2.5
+South
+psycopg2

@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block breadcrumb %}
+<li><a href="#">Home</a> <span class="divider">/</span></li>
+{% endblock%}
+{% block content %}
+<div class="container">
+	<section>
+		<div class="row-fluid">
+			<div class="span6">
+				<div class="page-header">
+					<h2>Projects</h2>
+				</div>
+				{% if project_list %}
+				<table class="eso-table">
+				<tr>
+					<th>Name</th>
+					<th>URL</th>
+				</tr>
+				{% for project in project_list %}
+				<tr>
+					<td><a href="{% url 'projects' project.pk %}">{{project}}</a></td>
+					<td><a href="{% url 'projects' project.pk %}">{{project.url}}</a></td>
+				</tr>
+				{%endfor%}
+				</table>
+				{%endif%}
+			</div>
+			<div class="span6">
+				<div class="page-header">
+					<h2>Developers</h2>
+				</div>
+				{% if author_list %}
+				<table class="eso-table">
+				<tr>
+					<th>Name</th>
+					<th>Email</th>
+				</tr>
+				{% for author in author_list %}
+				<tr>
+					<td><a href="{% url 'authors' author.pk %}">{{author.full_name}}</a></td>
+					<td><a href="{% url 'authors' author.pk %}">{{author.email}}</a></td>
+				</tr>
+				{%endfor%}
+				</table>
+				{%endif%}
+			</div>
+		</div>
+	</section>
+</div>
+{% endblock %}

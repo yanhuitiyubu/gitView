@@ -1,0 +1,169 @@
+{% extends "base.html" %}
+{% block customjs %}
+<script type="text/javascript" src="{{ STATIC_URL }}js/lib/underscore-min.js"></script>
+<script src="{{ STATIC_URL }}js/lib/bootstrap.min.js" type="text/javascript"></script>
+<script type="text/javascript" src="{{ STATIC_URL }}js/lib/linkage-select.js"></script>
+<script type="text/javascript" src="{{ STATIC_URL }}js/project-checkbox.js"></script>
+<script type="text/javascript" src="{{ STATIC_URL }}js/tag-select.js"></script>
+<script>
+	$(window).load(function(){
+
+		/* Create our data objects.
+		 * Formatted like d3.js's nest() function.
+		 */
+
+		var project_list = $.parseJSON('{{project_list | escape | escapejs}}');
+		var developer_list = $.parseJSON('{{developer_list | escapejs}}');
+		var tag_list = $.parseJSON('{{tag_list | escapejs}}')
+		var branch_developer = $.parseJSON('{{branch_developer | escapejs}}');
+		var developer_branch = $.parseJSON('{{developer_branch | escapejs}}');
+		var branch_tag = $.parseJSON('{{branch_tag | escapejs}}')
+		
+		$(document).on('click', '#expand-all-projects', function(e){
+			$('#projects').listTree('expandAll');
+		}).on('click', '#collapse-all-projects', function(e){
+			$('#projects').listTree('collapseAll');
+		});
+		
+		$('#projects').listTree(project_list, { "startCollapsed": true, "selected": [], "linkRelation": branch_developer, "linkObject": $('#developers') });
+		
+		$(document).on('click', '#select-all-developers', function(e){
+			$('#developers').listTree('selectAll');
+			initTagFunc();
+		}).on('click', '#deselect-all-developers', function(e){
+			$('#developers').listTree('deselectAll');
+			initTagFunc();
+		});
+		
+		$('#developers').listTree(developer_list, { "startCollapsed": true, "selected": [], "linkRelation": developer_branch, "linkObject": $('#projects') });
+		
+		var projectLinkageFunc = function(){
+			$('input:checkbox[name="projects"]').prop('disabled', true);
+			$('input:checkbox[name="subprojects"]').change(function() {
+				if ($(this).is(":checked")) {
+					var group;
+					if (this.name.indexOf('sub') == 0)
+					{
+						group = "input:checkbox[name='projects'], input:checkbox[name='subprojects']";
+					}
+					else
+					{
+						group = "input:checkbox[name='projects']";
+					}
+					$(group).prop("checked", false);
+					$(this).prop("checked", true);
+				}
+				else
+				{
+					$(this).prop("checked", false);
+				}
+				var branchChecked = $('#subprojects:checked');
+				var tagSelect1 = $('#tag1'), tagSelect2 = $('#tag2');
+				tagSelect1.empty();
+				tagSelect2.empty();
+				if(branchChecked.length != 0)
+				{
+					addOptions(tagSelect1, branch_tag[branchChecked.attr('value')], tag_list);
+					var options = $('#tag1 > option').clone();
+					$('#tag2').append(options);
+				}
+			});
+			$('input:checkbox[name="subprojects"]').click(function() {
+				$('#developers').find('#developers').each(function(){
+					$(this).click(function(){
+						$('input:checkbox[name="projects"]').prop('disabled', true);
+						$('#projects').find('#subprojects').each(projectLinkageFunc);
+					});
+				});
+			});
+		}
+		
+		function initTagFunc()
+		{
+			$('#projects').find('#subprojects').each(projectLinkageFunc);
+			$('#developers').find('#developers').each(function(){
+				$(this).click(function(){
+					$('input:checkbox[name="projects"]').prop('disabled', true);
+					$('#projects').find('#subprojects').each(projectLinkageFunc);
+				});
+			});
+			$('input:checkbox[name="projects"]').prop('disabled', true);
+		}
+		initTagFunc();
+	});
+</script>
+{% endblock %}
+{% block customstyle %}
+<link rel="stylesheet" type="text/css" href="{{ STATIC_URL }}css/project-checkbox.css">
+{% endblock %}
+{% block breadcrumb %}
+<li><a href="{% url 'tag-report' %}">Tag Report</a> <span class="divider">/</span></li>
+{% endblock %}
+{% block content %}
+<div class="container">
+	<form name="tag_report" action="tag_report" method="get">
+	<div class="row-fluid">
+		<div class="span3"></div>
+		<div class="span6">
+			<table class="table">
+				<tr>
+					<td width="15%">Tag Range:</td>
+					<td width="35%">
+						<select class="form-control" name="tag1" id="tag1">
+						</select>
+					</td>
+					<td width="35%">
+						<select class="form-control" name="tag2" id="tag2">
+						</select>
+					</td>
+					<td width="15%">
+						<input type="submit" value="Generate Report" type="button" class="btn btn-default"/></tr>
+					</td>
+				</tr>
+			</table>
+		</div>
+		<div class="span3"></div>
+	</div>
+		<table class="table" width="100%">
+			<tr>
+				<td width="33%">
+					<div class="mygrid-wrapper-div" />
+					<nav class="navbar navbar-sub" role="navigation" margin-bottom="0px">
+						<div class="mynavbar-header">
+							<a class="mynavbar-brand" href="#">Projects</a>
+						</div>
+						<div class="mynav mynavbar-nav mynavbar-right">
+							<div class="dropdown pull-right">
+								<a class="dropdown-toggle" data-toggle="dropdown">More <b class="caret"></b></a>
+								<ul class="dropdown-menu" role="menu">
+									<li><a id="expand-all-projects">Expand All</a></li>
+									<li><a id="collapse-all-projects">Collapse All</a></li>
+								</ul>
+							</div>
+						</div>
+					</nav>
+					<div class="listTree" id="projects"></div>
+				</td>
+				<td width="67%">
+					<div class="mygrid-wrapper-div" />
+					<nav class="navbar navbar-sub" role="navigation" margin-bottom="0px">
+						<div class="mynavbar-header">
+							<a class="mynavbar-brand">Team Members</a>
+						</div>
+						<div class="mynav mynavbar-nav mynavbar-right">
+							<div class="dropdown pull-right">
+								<a class="dropdown-toggle" data-toggle="dropdown">More <b class="caret"></b></a>
+								<ul class="dropdown-menu" role="menu">
+									<li><a id="select-all-developers">Select All</a></li>
+									<li><a id="deselect-all-developers">Deselect All</a></li>
+								</ul>
+							</div>
+						</div>
+					</nav>
+					<div class="listTree" id="developers"></div>
+				</td>
+			</tr>
+		</table>
+	</form>
+</div>
+{% endblock %}
